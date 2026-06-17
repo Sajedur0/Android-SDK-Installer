@@ -31,7 +31,7 @@ $inputSource = ""
 
 while ($true) {
     Write-Host "Enter Directory Address (folder path) OR Online Direct File Link (URL):" -ForegroundColor Yellow
-    Write-Host "Example: C:\Users\Zero\Downloads   or   https://dl.google.com/.../commandlinetools-..." -ForegroundColor Gray
+    Write-Host "Example: C:\Users\$env:USERNAME\Downloads   or   https://dl.google.com/.../commandlinetools-..." -ForegroundColor Gray
     Write-Host ""
     $inputSource = Read-Host "Address / URL"
 

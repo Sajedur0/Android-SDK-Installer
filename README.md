@@ -1,6 +1,6 @@
 # Android SDK & ADB Installer
 
-একটি সম্পূর্ণ PowerShell স্ক্রিপ্ট যা Windows-এ **Android SDK Command-line Tools**, **Platform-Tools (ADB)**, **SDK Platform** এবং **Build-Tools** অটোমেটিক্যালি ডাউনলোড, এক্সট্র্যাক্ট ও কনফিগার করে।
+An automated PowerShell script for Windows that downloads, extracts, and configures **Android SDK Command-line Tools**, **Platform-Tools (ADB)**, **SDK Platform**, and **Build-Tools** with a single command.
 
 ---
 
@@ -8,29 +8,25 @@
 
 | Feature | Details |
 |---|---|
-| **Dual Source Input** | Folder Path বা Online URL — যা দিবেন auto-detect করবে |
-| **Download Progress** | Online থেকে ডাউনলোড করলে MB ও Percentage দেখাবে |
-| **Fast Cleanup** | `rmdir /s /q` দিয়ে পুরনো ফাইল দ্রুত ডিলিট করে |
-| **Auto Extraction** | ZIP এক্সট্র্যাক্ট করে `cmdline-tools\latest\bin` স্ট্রাকচারে |
-| **SDK Components** | platform-tools, platforms;android-34, build-tools;34.0.0 ইন্সটল করে |
-| **Env Variables** | `ANDROID_HOME` (Machine) ও `PATH` (User) অটো সেট করে |
-| **License Manager** | `sdkmanager --licenses` রান করে — আপনি manually y/n দিতে পারেন |
-| **Version Display** | শেষে `sdkmanager --version` ও `adb --version` দেখায় |
-| **Admin Auto-Elevate** | নিজেই Administrator privilege নিয়ে নেয় |
-| **Error Retry** | ভুল ইনপুট দিলে error দেখিয়ে exit না করে আবার ইনপুট চায় |
+| **Dual Source Input** | Auto-detects whether you provided a folder path or an online URL |
+| **Download Progress** | Shows real-time MB and percentage progress for online downloads |
+| **Fast Cleanup** | Uses `rmdir /s /q` for quick removal of previous installations |
+| **Auto Extraction** | Extracts ZIP into the correct `cmdline-tools\latest\bin` structure |
+| **SDK Components** | Installs platform-tools, platforms;android-34, build-tools;34.0.0 |
+| **Env Variables** | Automatically sets `ANDROID_HOME` (Machine) and `PATH` (User) |
+| **License Manager** | Runs `sdkmanager --licenses` — you manually accept each with y/n |
+| **Version Display** | Shows `sdkmanager --version` and `adb --version` at the end |
+| **Auto Admin Elevation** | Self-elevates to Administrator privileges automatically |
+| **Error Retry** | Loops on invalid input instead of crashing |
 
 ---
 
 ## How to Use
 
 ### Method 1: Run.bat (Recommended)
-Simply double-click **`Run.bat`** — এটি automatically Admin privilege নিয়ে `Android_SDK.ps1` চালাবে।
+Double-click **`Run.bat`** — it automatically elevates to Admin and launches `Android_SDK.ps1`.
 
 ### Method 2: PowerShell Direct
-```powershell
-Run.bat
-```
-অথবা PowerShell এ গিয়ে:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
 ```
@@ -39,15 +35,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
 
 ## Input Types (Auto-Detect)
 
-আপনি একটি single prompt এ যেকোনো একটা দিতে পারেন:
+A single prompt accepts any of the following:
 
 | Input Type | Example | Behaviour |
 |---|---|---|
-| **Online URL** | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` | ডাউনলোড করবে (progress bar সহ) |
-| **Directory Path** | `C:\Users\Zero\Downloads` | ফোল্ডার স্ক্যান করে `cmdline-tools*.zip` খুঁজে নিবে |
-| **File Path** | `C:\Users\Zero\Downloads\cmdline-tools.zip` | সরাসরি ZIP ফাইল হিসেবে নিবে |
+| **Online URL** | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` | Downloads with progress bar |
+| **Directory Path** | `C:\Users\%USERNAME%\Downloads` | Scans folder for `cmdline-tools*.zip` |
+| **File Path** | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` | Uses the ZIP file directly |
 
-> একাধিক ZIP ফাইল পেলে আপনাকে কোনটা নিতে চান সেটি select করতে দেবে।
+> If multiple ZIP files are found, you will be prompted to choose one.
 
 ---
 
@@ -75,12 +71,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
 
 1. **CLOSE** the current window
 2. Open a **NEW** Terminal / CMD window
-3. Run:
+3. Verify installation:
    ```cmd
    adb --version
    sdkmanager --list
    ```
-4. Optional — accept licenses again if needed:
+4. Re-accept licenses if needed:
    ```cmd
    sdkmanager --licenses
    ```
