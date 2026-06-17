@@ -1,159 +1,213 @@
 # Android SDK & ADB Installer
 
+### Set up Android SDK on Windows — Without Installing Android Studio
+
 ---
 
 ## 🇬🇧 English
 
-An automated PowerShell script for Windows that downloads, extracts, and configures **Android SDK Command-line Tools**, **Platform-Tools (ADB)**, **SDK Platform**, and **Build-Tools** with a single command.
+### What is this?
 
-### Features
+A PowerShell script that **automatically installs and configures the Android SDK** on Windows **without needing Android Studio**. Just provide the cmdline-tools ZIP (from a local folder or direct download link), and the script handles everything — extraction, installing platform-tools, setting environment variables, and accepting licenses.
 
-| Feature | Details |
+### Why would I need this?
+
+- You want to use **Flutter**, **React Native**, **Cordova**, or other frameworks that require Android SDK
+- You don't want to install the full Android Studio (2+ GB) just for the SDK
+- You need **ADB (Android Debug Bridge)** for debugging or managing Android devices
+- You want a **clean, minimal SDK setup** without extra clutter
+- You need to **quickly set up or reset** the SDK on a new machine
+
+### What does this script do?
+
+| Step | What happens |
 |---|---|
-| **Dual Source Input** | Auto-detects whether you provided a folder path or an online URL |
-| **Download Progress** | Shows real-time MB and percentage progress for online downloads |
-| **Fast Cleanup** | Uses `rmdir /s /q` for quick removal of previous installations |
-| **Auto Extraction** | Extracts ZIP into the correct `cmdline-tools\latest\bin` structure |
-| **SDK Components** | Installs platform-tools, platforms;android-34, build-tools;34.0.0 |
-| **Env Variables** | Automatically sets `ANDROID_HOME` (Machine) and `PATH` (User) |
-| **License Manager** | Runs `sdkmanager --licenses` — you manually accept each with y/n |
-| **Version Display** | Shows `sdkmanager --version` and `adb --version` at the end |
-| **Auto Admin Elevation** | Self-elevates to Administrator privileges automatically |
-| **Error Retry** | Loops on invalid input instead of crashing |
+| 1. Input | You provide a **folder path** or **download URL** for cmdline-tools |
+| 2. Cleanup | Removes any previous `C:\Android` folder (fast) |
+| 3. Extract | Extracts the ZIP into `cmdline-tools\latest\bin` |
+| 4. SDK Install | Runs `sdkmanager` to install **platform-tools**, **platforms;android-34**, **build-tools;34.0.0** |
+| 5. Env Variables | Sets `ANDROID_HOME` (Machine) and updates `PATH` (User) |
+| 6. Licenses | Runs `sdkmanager --licenses` — you accept manually with y/n |
+| 7. Verify | Shows `sdkmanager --version` and `adb --version` |
 
-### How to Use
+### What gets installed to `C:\Android`?
 
-**Method 1: Run.bat (Recommended)** — Double-click `Run.bat` to auto-elevate and launch the script.
+```
+C:\Android\
+├── cmdline-tools\latest\bin\     ← sdkmanager, avdmanager, etc.
+├── platform-tools\               ← adb, fastboot
+├── platforms\android-34\         ← Android SDK Platform 34
+└── build-tools\34.0.0\           ← aapt, dx, zipalign, etc.
+```
 
-**Method 2: PowerShell Direct**
+### Environment Variables (set automatically)
+
+| Variable | Value | Scope | Purpose |
+|---|---|---|---|
+| `ANDROID_HOME` | `C:\Android` | Machine | Tells tools where the SDK is |
+| `PATH` (append) | `C:\Android\cmdline-tools\latest\bin` | User | Run `sdkmanager` from anywhere |
+| `PATH` (append) | `C:\Android\platform-tools` | User | Run `adb` from anywhere |
+| `JDK_JAVA_OPTIONS` | `--enable-native-access=ALL-UNNAMED` | Machine | Suppress Java warnings |
+
+### How to use
+
+**Step 1 — Get the cmdline-tools ZIP**
+
+- **Option A (Online):** Get the latest URL from [Android Studio Download Page](https://developer.android.com/studio#command-line-tools-only) (look for "Command line tools only")
+- **Option B (Offline):** If you already downloaded the ZIP, note its folder path
+
+**Step 2 — Run the installer**
+
+Double-click **`Run.bat`** (recommended) or run in PowerShell:
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
 ```
 
-### Input Types (Auto-Detect)
+**Step 3 — Provide input**
 
-| Input Type | Example | Behaviour |
-|---|---|---|
-| **Online URL** | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` | Downloads with progress bar |
-| **Directory Path** | `C:\Users\%USERNAME%\Downloads` | Scans folder for `cmdline-tools*.zip` |
-| **File Path** | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` | Uses the ZIP file directly |
+```
+Enter Directory Address (folder path) OR Online Direct File Link (URL):
+Example: C:\Users\%USERNAME%\Downloads   or   https://dl.google.com/...
 
-> If multiple ZIP files are found, you will be prompted to choose one.
+Address / URL:
+```
 
-### Installation Summary
+Give any one of these:
 
-| Component | Location |
+| Input Type | Example |
 |---|---|
-| **Command-line Tools** | `C:\Android\cmdline-tools\latest\bin\` |
-| **Platform-Tools (ADB)** | `C:\Android\platform-tools\` |
-| **SDK Platform 34** | `C:\Android\platforms\android-34\` |
-| **Build-Tools 34.0.0** | `C:\Android\build-tools\34.0.0\` |
+| Online URL | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` |
+| Directory (auto-scan) | `C:\Users\%USERNAME%\Downloads` |
+| File path (direct) | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` |
 
-**Environment Variables Set:**
-- `ANDROID_HOME` → `C:\Android` (Machine)
-- `PATH` → appends `cmdline-tools\latest\bin` and `platform-tools` (User)
-- `JDK_JAVA_OPTIONS` → `--enable-native-access=ALL-UNNAMED` (Machine)
+**Step 4 — Accept licenses**
 
-### After Installation
+When prompted, type `y` + Enter for each license shown.
 
-1. **CLOSE** the current window
-2. Open a **NEW** Terminal / CMD window
-3. Verify with: `adb --version` and `sdkmanager --list`
-4. Accept licenses if needed: `sdkmanager --licenses`
+**Step 5 — Done!**
+
+Close the window and open a new Terminal. Run `adb --version` and `sdkmanager --list` to verify.
 
 ### System Requirements
 
 - **OS:** Windows 10 / Windows 11
 - **PowerShell:** 5.1 or later
-- **Internet:** Required for online download & SDK components
-- **Java:** JDK 17+ recommended (for sdkmanager)
+- **Internet:** Needed for online download + SDK packages
+- **Java:** JDK 17+ (sdkmanager requires Java)
 
 ### Files
 
 | File | Purpose |
 |---|---|
-| `Android_SDK.ps1` | Main PowerShell installer script |
-| `Run.bat` | Batch launcher (auto admin + bypass policy) |
+| `Android_SDK.ps1` | Main PowerShell installer |
+| `Run.bat` | Double-click launcher (auto admin + bypass policy) |
 | `README.md` | This documentation |
 
 ---
 
 ## 🇧🇩 বাংলা
 
-একটি সম্পূর্ণ PowerShell স্ক্রিপ্ট যা Windows-এ **Android SDK Command-line Tools**, **Platform-Tools (ADB)**, **SDK Platform** এবং **Build-Tools** অটোমেটিক্যালি ডাউনলোড, এক্সট্র্যাক্ট ও কনফিগার করে।
+### এটা কী?
 
-### বৈশিষ্ট্যসমূহ
+একটি PowerShell স্ক্রিপ্ট যা **Android Studio ছাড়াই Windows-এ Android SDK সম্পূর্ণরূপে ইনস্টল ও কনফিগার করে**। আপনি শুধু cmdline-tools-এর ZIP ফাইলটির লোকেশন বা ডাউনলোড লিংক দিবেন, বাকি সব — এক্সট্র্যাক্ট করা, platform-tools ইনস্টল করা, এনভায়রনমেন্ট ভেরিয়েবল সেট করা, লাইসেন্স অ্যাকসেপ্ট করা — স্ক্রিপ্ট নিজেই করে ফেলে।
 
-| বৈশিষ্ট্য | বিবরণ |
+### কেন দরকার?
+
+- **Flutter**, **React Native**, **Cordova** ইত্যাদি ফ্রেমওয়ার্ক ব্যবহার করতে Android SDK লাগে
+- শুধুমাত্র SDK-এর জন্য **পুরো Android Studio (২+ GB)** ইনস্টল করতে চান না
+- Android ডিভাইস ম্যানেজ বা ডিবাগ করতে **ADB** দরকার
+- একটি **পরিষ্কার ও মিনিমাল SDK সেটআপ** চান
+- নতুন কম্পিউটারে **দ্রুত SDK সেটআপ** করতে চান
+
+### স্ক্রিপ্টটি কী কী করে?
+
+| ধাপ | কী হয় |
 |---|---|
-| **ডুয়াল সোর্স ইনপুট** | ফোল্ডার পাথ বা অনলাইন URL — যা দিবেন অটো ডিটেক্ট করবে |
-| **ডাউনলোড প্রোগ্রেস** | অনলাইন থেকে ডাউনলোড করলে MB ও পার্সেন্টেজ দেখাবে |
-| **দ্রুত ক্লিনআপ** | `rmdir /s /q` দিয়ে পুরনো ফাইল দ্রুত ডিলিট করে |
-| **অটো এক্সট্র্যাক্ট** | ZIP এক্সট্র্যাক্ট করে `cmdline-tools\latest\bin` স্ট্রাকচারে |
-| **SDK কম্পোনেন্টস** | platform-tools, platforms;android-34, build-tools;34.0.0 ইন্সটল করে |
-| **এনভায়রনমেন্ট ভেরিয়েবল** | `ANDROID_HOME` (Machine) ও `PATH` (User) অটো সেট করে |
-| **লাইসেন্স ম্যানেজার** | `sdkmanager --licenses` রান করে — আপনি manually y/n দিতে পারেন |
-| **ভার্সন দেখানো** | শেষে `sdkmanager --version` ও `adb --version` দেখায় |
-| **অটো অ্যাডমিন** | নিজেই Administrator privilege নিয়ে নেয় |
-| **এরর রিট্রাই** | ভুল ইনপুট দিলে error দেখিয়ে exit না করে আবার ইনপুট চায় |
+| ১. ইনপুট | আপনি cmdline-tools-এর **ফোল্ডার পাথ** বা **ডাউনলোড URL** দেন |
+| ২. ক্লিনআপ | আগের `C:\Android` ফোল্ডার থাকলে দ্রুত ডিলিট করে |
+| ৩. এক্সট্র্যাক্ট | ZIP ফাইলকে `cmdline-tools\latest\bin` স্ট্রাকচারে এক্সট্র্যাক্ট করে |
+| ৪. SDK ইনস্টল | `sdkmanager` দিয়ে **platform-tools**, **platforms;android-34**, **build-tools;34.0.0** ইনস্টল করে |
+| ৫. এনভায়রনমেন্ট | `ANDROID_HOME` (Machine) সেট করে এবং `PATH` (User) আপডেট করে |
+| ৬. লাইসেন্স | `sdkmanager --licenses` রান করে — আপনি manually y/n দেন |
+| ৭. ভেরিফাই | শেষে `sdkmanager --version` ও `adb --version` দেখায় |
+
+### `C:\Android`-এ কী কী ইনস্টল হয়?
+
+```
+C:\Android\
+├── cmdline-tools\latest\bin\     ← sdkmanager, avdmanager, ইত্যাদি
+├── platform-tools\               ← adb, fastboot
+├── platforms\android-34\         ← Android SDK Platform 34
+└── build-tools\34.0.0\           ← aapt, dx, zipalign, ইত্যাদি
+```
+
+### এনভায়রনমেন্ট ভেরিয়েবল (অটো সেট হয়)
+
+| ভেরিয়েবল | ভ্যালু | স্কোপ | উদ্দেশ্য |
+|---|---|---|---|
+| `ANDROID_HOME` | `C:\Android` | Machine | টুলসকে SDK-এর লোকেশন জানায় |
+| `PATH` (যোগ) | `C:\Android\cmdline-tools\latest\bin` | User | যেকোনো জায়গা থেকে `sdkmanager` চালানো |
+| `PATH` (যোগ) | `C:\Android\platform-tools` | User | যেকোনো জায়গা থেকে `adb` চালানো |
+| `JDK_JAVA_OPTIONS` | `--enable-native-access=ALL-UNNAMED` | Machine | Java ওয়ার্নিং বন্ধ করে |
 
 ### ব্যবহার বিধি
 
-**পদ্ধতি ১: Run.bat (সুপারিশকৃত)** — `Run.bat` এ ডাবল-ক্লিক করুন, এটি নিজেই অ্যাডমিন প্রিভিলেজ নিয়ে `Android_SDK.ps1` চালাবে।
+**ধাপ ১ — cmdline-tools-এর ZIP সংগ্রহ করুন**
 
-**পদ্ধতি ২: PowerShell ডাইরেক্ট**
+- **অনলাইন:** [Android Studio Download Page](https://developer.android.com/studio#command-line-tools-only) থেকে লেটেস্ট লিংক নিন ("Command line tools only" সেকশন)
+- **অফলাইন:** আগে থেকে ডাউনলোড করা থাকলে ফোল্ডার পাথ নোট করে রাখুন
+
+**ধাপ ২ — ইন্সটলার রান করুন**
+
+`Run.bat`-এ **ডাবল-ক্লিক** করুন (সুপারিশকৃত) অথবা PowerShell-এ রান করুন:
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
 ```
 
-### ইনপুট টাইপ (অটো-ডিটেক্ট)
+**ধাপ ৩ — ইনপুট দিন**
 
-| ইনপুট টাইপ | উদাহরণ | আচরণ |
-|---|---|---|
-| **অনলাইন URL** | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` | প্রোগ্রেস বার সহ ডাউনলোড করবে |
-| **ডিরেক্টরি পাথ** | `C:\Users\%USERNAME%\Downloads` | ফোল্ডার স্ক্যান করে `cmdline-tools*.zip` খুঁজে নিবে |
-| **ফাইল পাথ** | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` | সরাসরি ZIP ফাইল হিসেবে নিবে |
+```
+Enter Directory Address (folder path) OR Online Direct File Link (URL):
+Example: C:\Users\%USERNAME%\Downloads   or   https://dl.google.com/...
 
-> একাধিক ZIP ফাইল পেলে আপনি কোনটা নিতে চান সেটি সিলেক্ট করতে পারবেন।
+Address / URL:
+```
 
-### ইন্সটলেশন সারসংক্ষেপ
+নিচের যেকোনো একটি দিন:
 
-| কম্পোনেন্ট | লোকেশন |
+| ইনপুট টাইপ | উদাহরণ |
 |---|---|
-| **কমান্ড-লাইন টুলস** | `C:\Android\cmdline-tools\latest\bin\` |
-| **প্ল্যাটফর্ম-টুলস (ADB)** | `C:\Android\platform-tools\` |
-| **SDK প্ল্যাটফর্ম 34** | `C:\Android\platforms\android-34\` |
-| **বিল্ড-টুলস 34.0.0** | `C:\Android\build-tools\34.0.0\` |
+| অনলাইন URL | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` |
+| ডিরেক্টরি (অটো-স্ক্যান) | `C:\Users\%USERNAME%\Downloads` |
+| ফাইল পাথ (সরাসরি) | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` |
 
-**এনভায়রনমেন্ট ভেরিয়েবল সেট হয়:**
-- `ANDROID_HOME` → `C:\Android` (Machine)
-- `PATH` → `cmdline-tools\latest\bin` ও `platform-tools` যোগ হয় (User)
-- `JDK_JAVA_OPTIONS` → `--enable-native-access=ALL-UNNAMED` (Machine)
+**ধাপ ৪ — লাইসেন্স অ্যাকসেপ্ট করুন**
 
-### ইন্সটলের পরে
+প্রতিটি লাইসেন্সের জন্য `y` + Enter দিন।
 
-1. বর্তমান উইন্ডো **বন্ধ** করুন
-2. একটি **নতুন** Terminal / CMD উইন্ডো খুলুন
-3. ভেরিফাই করুন: `adb --version` এবং `sdkmanager --list`
-4. লাইসেন্স একসেপ্ট করতে: `sdkmanager --licenses`
+**ধাপ ৫ — শেষ!**
+
+উইন্ডো বন্ধ করে নতুন Terminal খুলুন। `adb --version` এবং `sdkmanager --list` দিয়ে ভেরিফাই করুন।
 
 ### সিস্টেম প্রয়োজনীয়তা
 
 - **OS:** Windows 10 / Windows 11
 - **PowerShell:** 5.1 বা তার পরের
-- **ইন্টারনেট:** অনলাইন ডাউনলোড ও SDK কম্পোনেন্টস এর জন্য প্রয়োজন
-- **Java:** JDK 17+ (sdkmanager এর জন্য সুপারিশকৃত)
+- **ইন্টারনেট:** অনলাইন ডাউনলোড ও SDK প্যাকেজের জন্য প্রয়োজন
+- **Java:** JDK 17+ (sdkmanager চালানোর জন্য)
 
 ### ফাইলসমূহ
 
 | ফাইল | উদ্দেশ্য |
 |---|---|
 | `Android_SDK.ps1` | মূল PowerShell ইন্সটলার স্ক্রিপ্ট |
-| `Run.bat` | ব্যাচ লঞ্চার (অটো অ্যাডমিন + বাইপাস পলিসি) |
+| `Run.bat` | ডাবল-ক্লিক লঞ্চার (অটো অ্যাডমিন + বাইপাস পলিসি) |
 | `README.md` | এই ডকুমেন্টেশন |
 
 ---
 
 ## License
 
-This project is licensed under the **Apache License 2.0**.
+**Apache License 2.0**
