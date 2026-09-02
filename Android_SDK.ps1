@@ -162,11 +162,7 @@ if ($userPath -notlike "*$adbPath*") { $userPath = "$userPath;$adbPath" }
 [Environment]::SetEnvironmentVariable("Path", $userPath, "User")
 Write-Host "[+] Added SDK binaries and ADB to your User PATH." -ForegroundColor Green
 
-# 9. Suppress Java Restriction Warnings
-[Environment]::SetEnvironmentVariable("JDK_JAVA_OPTIONS", "--enable-native-access=ALL-UNNAMED", "Machine")
-Write-Host "[+] Successfully suppressed Java native access restrictions warnings." -ForegroundColor Green
-
-# 10. Accept SDK Licenses (interactive — you type y/n)
+# 9. Accept SDK Licenses (interactive — you type y/n)
 Write-Host "`n=========================================================" -ForegroundColor Cyan
 Write-Host "         Accept Android SDK Licenses (if prompted)       " -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
@@ -175,13 +171,29 @@ Write-Host ""
 & cmd /c "`"$sdkManagerBin`" --licenses"
 Write-Host ""
 
-# 11. Show installed versions
+# 10. Show installed versions
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host "               INSTALLED VERSIONS                        " -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "[*] sdkmanager version:" -ForegroundColor Yellow
-& cmd /c "`"$sdkManagerBin`" --version"
+# Fix: sdkmanager 22.0+ prints deprecation WARNING (deprecated in favor of 'android' CLI) - filter it
+$rawVersion = & cmd /c "`"$sdkManagerBin`" --version 2>&1"
+$cleanVersion = $rawVersion | Where-Object { $_ -match "^\s*\d+(\.\d+)*\s*$" } | Select-Object -Last 1
+if ($cleanVersion) {
+    Write-Host $cleanVersion.ToString().Trim()
+} else {
+    $filtered = $rawVersion | Where-Object { $_ -notmatch "WARNING|deprecated|The 'android' binary|https://d\.android\.com" -and $_.ToString().Trim() -ne "" }
+    if ($filtered) { $filtered | ForEach-Object { Write-Host $_ } }
+}
+# Also show new Android CLI version if available (replacement for sdkmanager in 22.0+)
+$androidBin = "$latestFolder\bin\android.bat"
+if (-not (Test-Path $androidBin)) { $androidBin = "$latestFolder\bin\android.exe" }
+if (Test-Path $androidBin) {
+    Write-Host ""
+    Write-Host "[*] android CLI version:" -ForegroundColor Yellow
+    & cmd /c "`"$androidBin`" --version 2>&1" | Where-Object { $_ -notmatch "^\s*$" } | ForEach-Object { Write-Host $_ }
+}
 Write-Host ""
 Write-Host "[*] adb version:" -ForegroundColor Yellow
 $adbBin = "$platformToolsPath\adb.exe"
