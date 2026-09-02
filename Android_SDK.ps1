@@ -12,6 +12,15 @@ if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
 # =========================================================================
 $ErrorActionPreference = "Stop"
 
+function Wait-Esc {
+    param([string]$Prompt = "Press Esc to exit...")
+    Write-Host $Prompt -ForegroundColor Yellow
+    while ($true) {
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        if ($key.VirtualKeyCode -eq 27) { break }
+    }
+}
+
 # 1. Define Core Paths
 $sdkRoot = "C:\Android"
 $cmdlineToolsFolder = "$sdkRoot\cmdline-tools"
@@ -19,9 +28,208 @@ $latestFolder = "$cmdlineToolsFolder\latest"
 $zipPath = "$sdkRoot\cmdline-tools.zip"
 $platformToolsPath = "$sdkRoot\platform-tools"
 
+# =========================================================================
+# TOOL MENU
+# =========================================================================
+:toolMenu while ($true) {
+    Clear-Host
+    Write-Host "=========================================================" -ForegroundColor Cyan
+    Write-Host "         Flexible Android SDK & ADB Installer            " -ForegroundColor Cyan
+    Write-Host "                    Tool Menu                           " -ForegroundColor Cyan
+    Write-Host "=========================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  1. Android SDK Installation" -ForegroundColor Yellow
+    Write-Host "  2. Flutter Installation" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  0. Exit" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "=========================================================" -ForegroundColor Cyan
+    $menuChoice = Read-Host "Enter your choice (1-2, 0 to exit)"
+
+    switch ($menuChoice) {
+        "1" { break toolMenu }
+        "2" {
+            Clear-Host
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host "               Flutter Installation                    " -ForegroundColor Cyan
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host ""
+
+            # Flutter paths
+            $flutterRoot = "C:\flutter"
+            $flutterBin = "$flutterRoot\bin"
+            $flutterZipPath = "C:\flutter.zip"
+            $tempFlutterExtract = "C:\temp_flutter_extract"
+            $isFlutterLocalFile = $false
+            $flutterInputSource = ""
+
+            # Input loop - Directory / File / URL
+            while ($true) {
+                Write-Host "Enter Directory Address (folder path) OR Online Direct File Link (URL):" -ForegroundColor Yellow
+                Write-Host "Example: C:\Users\$env:USERNAME\Downloads   or   https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_...-stable.zip" -ForegroundColor Gray
+                Write-Host ""
+                $flutterInputSource = Read-Host "Address / URL"
+                # Fix Copy as path quotes: "D:\path\file.zip" -> D:\path\file.zip
+                $flutterInputSource = $flutterInputSource.Trim().Trim('"').Trim("'").Trim()
+
+                if ([string]::IsNullOrWhiteSpace($flutterInputSource)) {
+                    Write-Host "[-] Input cannot be empty. Please try again." -ForegroundColor Red
+                    Write-Host ""
+                    continue
+                }
+
+                if ($flutterInputSource -match "^https?://") {
+                    Write-Host "[+] Detected as Online URL" -ForegroundColor Green
+                    break
+                }
+
+                if (Test-Path -LiteralPath $flutterInputSource -PathType Container) {
+                    Write-Host "[+] Detected as Local Directory" -ForegroundColor Green
+                    $zipFiles = Get-ChildItem -LiteralPath $flutterInputSource -Filter "flutter*.zip" -File
+                    if ($zipFiles.Count -eq 0) {
+                        # Fallback: try any zip containing flutter
+                        $zipFiles = Get-ChildItem -LiteralPath $flutterInputSource -Filter "*.zip" -File | Where-Object { $_.Name -like "*flutter*" }
+                    }
+                    if ($zipFiles.Count -eq 0) {
+                        Write-Host "[-] No flutter*.zip file found in that directory." -ForegroundColor Red
+                        Write-Host ""
+                        continue
+                    }
+                    if ($zipFiles.Count -eq 1) {
+                        $flutterInputSource = $zipFiles[0].FullName
+                        Write-Host "[+] Auto-detected ZIP: $(Split-Path $flutterInputSource -Leaf)" -ForegroundColor Green
+                    } else {
+                        Write-Host "Multiple flutter ZIP files found. Please choose:" -ForegroundColor Yellow
+                        for ($i = 0; $i -lt $zipFiles.Count; $i++) {
+                            Write-Host "$($i+1). $($zipFiles[$i].Name) ($([math]::Round($zipFiles[$i].Length / 1MB, 2)) MB)"
+                        }
+                        $fileChoice = Read-Host "Enter the number (1-$($zipFiles.Count))"
+                        $fileIndex = [int]$fileChoice - 1
+                        if ($fileIndex -lt 0 -or $fileIndex -ge $zipFiles.Count) {
+                            Write-Host "[-] Invalid selection." -ForegroundColor Red
+                            Write-Host ""
+                            continue
+                        }
+                        $flutterInputSource = $zipFiles[$fileIndex].FullName
+                    }
+                    $isFlutterLocalFile = $true
+                    break
+                }
+
+                if (Test-Path -LiteralPath $flutterInputSource -PathType Leaf) {
+                    Write-Host "[+] Detected as Local File" -ForegroundColor Green
+                    $isFlutterLocalFile = $true
+                    break
+                }
+
+                Write-Host "[-] Invalid input. Provide a valid folder path, file path, or URL." -ForegroundColor Red
+                Write-Host ""
+            }
+
+            # Cleanup previous Flutter installation
+            if (Test-Path $flutterRoot) {
+                Write-Host "`n[*] Cleaning up previous Flutter installation (fast mode)..." -ForegroundColor Yellow
+                & cmd /c "rmdir /s /q `"$flutterRoot`" 2>nul"
+            }
+            if (Test-Path $tempFlutterExtract) {
+                & cmd /c "rmdir /s /q `"$tempFlutterExtract`" 2>nul"
+            }
+            if (Test-Path $flutterZipPath) { Remove-Item $flutterZipPath -Force -ErrorAction SilentlyContinue }
+
+            # Download or Copy
+            if ($isFlutterLocalFile) {
+                Write-Host "[*] Copying your local Flutter ZIP file..." -ForegroundColor Yellow
+                Copy-Item -Path $flutterInputSource -Destination $flutterZipPath -Force
+            } else {
+                Write-Host "[*] Downloading Flutter from URL (progress shown below)..." -ForegroundColor Yellow
+                $wc = New-Object System.Net.WebClient
+                $wc.DownloadProgressChanged += {
+                    param($sender, $e)
+                    $pct = $e.ProgressPercentage
+                    $dl = $e.BytesReceived
+                    $total = $e.TotalBytesToReceive
+                    if ($total -gt 0) {
+                        Write-Progress -Activity "Downloading Flutter..." -Status "$([math]::Round($dl/1MB, 2)) MB / $([math]::Round($total/1MB, 2)) MB ($pct%)" -PercentComplete $pct
+                    }
+                }
+                $wc.DownloadFileAsync($flutterInputSource, $flutterZipPath)
+                while ($wc.IsBusy) { Start-Sleep -Milliseconds 100 }
+                Write-Progress -Activity "Downloading Flutter..." -Completed
+            }
+
+            # Extract to temp then move flutter folder to C:\flutter
+            Write-Host "[*] Extracting Flutter..." -ForegroundColor Yellow
+            Expand-Archive -Path $flutterZipPath -DestinationPath $tempFlutterExtract -Force
+
+            # Find flutter folder inside temp
+            $extractedFlutter = Get-ChildItem -Path $tempFlutterExtract -Directory | Where-Object { $_.Name -eq "flutter" } | Select-Object -First 1
+            if (-not $extractedFlutter) {
+                # Some zips may extract directly without top folder, fallback: move all contents
+                $extractedFlutter = Get-ChildItem -Path $tempFlutterExtract | Select-Object -First 1
+                if ($extractedFlutter -and $extractedFlutter.PSIsContainer) {
+                    # If single folder, assume it's flutter
+                    Move-Item -Path $extractedFlutter.FullName -Destination $flutterRoot -Force
+                } else {
+                    New-Item -ItemType Directory -Path $flutterRoot -Force | Out-Null
+                    Get-ChildItem -Path $tempFlutterExtract | ForEach-Object { Move-Item -Path $_.FullName -Destination $flutterRoot -Force }
+                }
+            } else {
+                Move-Item -Path $extractedFlutter.FullName -Destination $flutterRoot -Force
+            }
+
+            # Cleanup temp and zip
+            Remove-Item -Path $tempFlutterExtract -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $flutterZipPath) { Remove-Item $flutterZipPath -Force -ErrorAction SilentlyContinue }
+            Write-Host "[+] Flutter extracted successfully to $flutterRoot" -ForegroundColor Green
+
+            # Add flutter\bin to User PATH
+            Write-Host "[*] Configuring PATH for Flutter..." -ForegroundColor Yellow
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            if ($userPath -notlike "*$flutterBin*") {
+                if ([string]::IsNullOrEmpty($userPath)) { $userPath = $flutterBin } else { $userPath = "$userPath;$flutterBin" }
+                [Environment]::SetEnvironmentVariable("Path", $userPath, "User")
+                Write-Host "[+] Added $flutterBin to User PATH." -ForegroundColor Green
+            } else {
+                Write-Host "[*] Flutter bin already in PATH." -ForegroundColor Gray
+            }
+            # Also update current session PATH
+            if ($env:Path -notlike "*$flutterBin*") { $env:Path += ";$flutterBin" }
+
+            # Show Flutter version / status
+            Write-Host ""
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host "                 FLUTTER VERSION                       " -ForegroundColor Cyan
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host ""
+            $flutterBat = "$flutterBin\flutter.bat"
+            if (Test-Path $flutterBat) {
+                Write-Host "[*] flutter version:" -ForegroundColor Yellow
+                & cmd /c "`"$flutterBat`" --version"
+                Write-Host ""
+            } else {
+                Write-Warning "flutter.bat not found at $flutterBat"
+            }
+
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host "               FLUTTER INSTALL COMPLETE!               " -ForegroundColor Cyan
+            Write-Host "=========================================================" -ForegroundColor Cyan
+            Write-Host "Please open a NEW Terminal/CMD window to use flutter." -ForegroundColor Yellow
+            Write-Host ""
+            Wait-Esc "Press Esc to return to menu..."
+            continue toolMenu
+        }
+        "0" { Wait-Esc "Press Esc to exit..."; Exit }
+        default {
+            Write-Host "[-] Invalid choice. Please enter 1, 2 or 0." -ForegroundColor Red
+            Start-Sleep -Seconds 1
+            continue toolMenu
+        }
+    }
+}
+
 Clear-Host
 Write-Host "=========================================================" -ForegroundColor Cyan
-Write-Host "         Flexible Android SDK & ADB Installer            " -ForegroundColor Cyan
+Write-Host "              Android SDK Installation                   " -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -34,6 +242,8 @@ while ($true) {
     Write-Host "Example: C:\Users\$env:USERNAME\Downloads   or   https://dl.google.com/.../commandlinetools-..." -ForegroundColor Gray
     Write-Host ""
     $inputSource = Read-Host "Address / URL"
+    # Fix Copy as path quotes: "D:\path\file.zip" -> D:\path\file.zip
+    $inputSource = $inputSource.Trim().Trim('"').Trim("'").Trim()
 
     if ([string]::IsNullOrWhiteSpace($inputSource)) {
         Write-Host "[-] Input cannot be empty. Please try again." -ForegroundColor Red
@@ -207,6 +417,6 @@ Write-Host ""
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host "                INSTALLATION COMPLETE!                  " -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
-Write-Host "Please CLOSE this window and open a NEW Terminal/CMD window." -ForegroundColor Yellow
+Write-Host "Please open a NEW Terminal/CMD window to use adb / sdkmanager." -ForegroundColor Yellow
 Write-Host ""
-Read-Host "Press Enter to exit..."
+Wait-Esc "Press Esc to exit..."
