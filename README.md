@@ -55,7 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\Progress.Demo.ps1
 
 ### Environment path check
 
-Choose **3. Check Environment Paths** to check the Machine, User, and current Process scopes. The read-only check reports `JAVA_HOME` and JDK executables, Python executables or the `py` launcher, Android SDK variables and tools, whether accepted SDK license files are recorded under `<SDK>\licenses`, `FLUTTER_ROOT`, and whether their expected directories are in `PATH`. Python is checked only; this installer does not install it. Open a new terminal after a Machine or User PATH change.
+Choose **3. Check Environment Paths** to check the Machine, User, and current Process scopes. The read-only check reports `JAVA_HOME` and JDK executables, Python executables or the `py` launcher, Android SDK variables and tools, whether accepted SDK license files are recorded under `<SDK>\licenses`, the optional Android Emulator install and `PATH` state, `FLUTTER_ROOT`, and whether their expected directories are in `PATH`. Python is checked only; this installer does not install it. Open a new terminal after a Machine or User PATH change.
 
 ### Java SDK + Android SDK install flow
 
@@ -64,9 +64,17 @@ Choose **1** and the installer runs these steps automatically:
 1. **Java SDK** — if no JDK 17+ is found, Eclipse Temurin JDK 17 is installed without a prompt. It uses `winget` when available, otherwise downloads Temurin JDK 17 from Adoptium.
 2. **Android command-line tools** — the latest Google command-line tools build is looked up from the Android developer download page (with a built-in fallback build if that page cannot be read), downloaded with a live progress bar, and installed to `C:\Android\cmdline-tools\latest`. A previous `latest` folder is kept in a timestamped backup.
 3. **SDK packages** — the installer asks once whether to accept every Android SDK license. `Y` (or Enter) answers each `sdkmanager --licenses` prompt for you; `N` shows the prompts so you can review each license and type `y` yourself. Licenses are never accepted without that choice. The result is then verified, and if `sdkmanager` did not record it, the installer writes the published license files under `C:\Android\licenses` and verifies again. Packages are installed next: **platform-tools**, **Android Platform 36**, and the latest available **Build Tools 36.x**, plus the latest stable **NDK** and **CMake** when the package catalog provides them.
-4. **Environment** — `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` (when NDK is installed) are set, and Machine `PATH` receives the JDK `bin`, `cmdline-tools\latest\bin`, `platform-tools`, the latest `build-tools`, `emulator` (if present), and the latest `cmake\<version>\bin` (if present).
+4. **Environment** — `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` (when NDK is installed) are set, and Machine `PATH` receives the JDK `bin`, `cmdline-tools\latest\bin`, `platform-tools`, the latest `build-tools`, and the latest `cmake\<version>\bin` (if present). The `emulator` folder is never added automatically.
 
-Finally the installer verifies the required files (`adb.exe`, `android.jar`, and `aapt2.exe`) before reporting success. The Android Emulator and system images are not downloaded by default; install them separately with `sdkmanager` if you want a virtual device.
+Finally the installer verifies the required files (`adb.exe`, `android.jar`, and `aapt2.exe`) before reporting success. The Android Emulator and system images are opt-in only: the installer never downloads them and never adds an existing `C:\Android\emulator` folder to `PATH`. Android Studio, Gradle, and `flutter emulators` reach the Emulator through `ANDROID_HOME`, so no PATH entry is needed for them. To use the `emulator -avd <name>` command line yourself, install and register it afterwards:
+
+```powershell
+sdkmanager --sdk_root=C:\Android "emulator" "system-images;android-36;google_apis;x86_64"
+avdmanager create avd -n api36 -k "system-images;android-36;google_apis;x86_64"
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';C:\Android\emulator', 'Machine')
+```
+
+Choose **3. Check Environment Paths** to see a `[INFO]` line reporting whether an installed Emulator is or is not on `PATH`.
 
 ### Flutter install flow
 
@@ -111,7 +119,7 @@ adb version
 flutter doctor -v
 ```
 
-For the SDK package list, use `android sdk list` if the Android CLI is installed, or `sdkmanager --list` otherwise.
+For the SDK package list, use `android sdk list` if the Android CLI is installed, or `sdkmanager --list` otherwise. The Emulator is not installed or registered on `PATH` by default, so the `emulator` command is expected to be missing until you add it with the optional commands above; `adb version` and `flutter doctor -v` do not need it.
 
 ---
 

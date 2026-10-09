@@ -294,6 +294,13 @@ Assert-True ($scriptText -match 'Invoke-ExternalInteractive -Path \$SdkManager -
 Assert-True ($scriptText -match '\$licenseArgs = @\("--sdk_root=') 'The license arguments point at --licenses'
 Assert-True ($scriptText -notmatch '\|\s*Out-Host') 'Native output is no longer sent through Out-Host'
 
+# --- 9. The optional Android Emulator stays out of Machine PATH --------------
+# The installer never downloads the Emulator, so it must never claim <SDK>\emulator for PATH either.
+$entriesBlock = [regex]::Match($scriptText, '(?s)\$entries = @\(.*?\r?\n    \)').Value
+Assert-True ($entriesBlock.Length -gt 0) 'The Machine PATH entry list was found'
+Assert-True ($entriesBlock -notmatch 'emulator') 'The Emulator folder is not an automatic PATH entry'
+Assert-True ($scriptText -match 'Get-PathEntryScopes \$emulatorRoot') 'The environment check reports the Emulator PATH state'
+
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- Summary -----------------------------------------------------------------

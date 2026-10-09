@@ -169,10 +169,13 @@ function Set-AndroidEnvironment {
         Add-PathEntry (Join-Path $javaHome 'bin') 'Machine'
     }
 
+    # The Emulator is opt-in only: the installer never downloads it, so an <SDK>\emulator folder
+    # left behind by Android Studio must not be claimed by Machine PATH. Android Studio, Gradle,
+    # and `flutter emulators` reach the Emulator through ANDROID_HOME, not through PATH, so nothing
+    # breaks without this entry. For the `emulator -avd <name>` command line workflow, add it by hand.
     $entries = @(
         (Join-Path $script:SdkRoot 'cmdline-tools\latest\bin'),
-        (Join-Path $script:SdkRoot 'platform-tools'),
-        (Join-Path $script:SdkRoot 'emulator')
+        (Join-Path $script:SdkRoot 'platform-tools')
     )
     $buildTools = Get-LatestVersionFolder (Join-Path $script:SdkRoot 'build-tools')
     if ($buildTools) { $entries += $buildTools }
@@ -1690,6 +1693,21 @@ function Show-EnvironmentPathStatus {
         Write-EnvironmentCheckResult 'OK' "Accepted SDK licenses are recorded under $sdkLicenses ($licenseCount file(s))"
     } else {
         Write-EnvironmentCheckResult 'MISSING' "No accepted SDK licenses were found under $sdkLicenses. Run: `"$sdkManager`" --sdk_root=$androidRoot --licenses"
+    }
+
+    # The Emulator folder is no longer added to PATH automatically, so report its real state instead
+    # of leaving a missing PATH entry to look like an installation failure.
+    $emulatorRoot = Join-Path $androidRoot 'emulator'
+    $emulatorExe = Join-Path $emulatorRoot 'emulator.exe'
+    if (Test-Path -LiteralPath $emulatorExe -PathType Leaf) {
+        $emulatorScopes = @(Get-PathEntryScopes $emulatorRoot)
+        if ($emulatorScopes.Count -gt 0) {
+            Write-Host "[INFO] The Android Emulator is installed and appears in $($emulatorScopes -join ', ') PATH. This installer no longer adds it; remove that entry by hand if you do not want it." -ForegroundColor Gray
+        } else {
+            Write-Host "[INFO] The Android Emulator is installed at $emulatorRoot but is not on PATH. That is the intended default: Android Studio and Flutter use it through ANDROID_HOME, and only the 'emulator' command line needs the extra PATH entry." -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "[INFO] The Android Emulator is not installed under $androidRoot. The installer never downloads it; run `"$sdkManager`" --sdk_root=$androidRoot `"emulator`" `"system-images;android-36;google_apis;x86_64`" and create the device with AVD Manager or avdmanager." -ForegroundColor Gray
     }
 
     Write-Host ''
