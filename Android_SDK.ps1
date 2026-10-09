@@ -236,10 +236,10 @@ function Find-ExtractedJdkHome {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $null }
     $roots = @($Root)
     foreach ($dir in (Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)) { $roots += $dir.FullName }
-    foreach ($home in $roots) {
-        $java = Join-Path $home 'bin\java.exe'
-        $javac = Join-Path $home 'bin\javac.exe'
-        if ((Test-Path -LiteralPath $java -PathType Leaf) -and (Test-Path -LiteralPath $javac -PathType Leaf)) { return $home }
+    foreach ($candidateHome in $roots) {
+        $java = Join-Path $candidateHome 'bin\java.exe'
+        $javac = Join-Path $candidateHome 'bin\javac.exe'
+        if ((Test-Path -LiteralPath $java -PathType Leaf) -and (Test-Path -LiteralPath $javac -PathType Leaf)) { return $candidateHome }
     }
     return $null
 }
@@ -329,8 +329,8 @@ function Get-JdkInfo {
     }
     $javac = Get-Command 'javac.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($javac) {
-        $home = Split-Path -Parent (Split-Path -Parent $javac.Source)
-        $candidate = Join-Path $home 'bin\java.exe'
+        $javacHome = Split-Path -Parent (Split-Path -Parent $javac.Source)
+        $candidate = Join-Path $javacHome 'bin\java.exe'
         if (Test-Path -LiteralPath $candidate) { $candidates += $candidate }
     }
     $java = Get-Command 'java.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -342,14 +342,14 @@ function Get-JdkInfo {
         if ($seen -contains $key -or -not (Test-Path -LiteralPath $javaPath -PathType Leaf)) { continue }
         $seen += $key
         $bin = Split-Path -Parent $javaPath
-        $home = Split-Path -Parent $bin
+        $javaHomeDir = Split-Path -Parent $bin
         $versionResult = Invoke-ExternalCapture -Path $javaPath -ArgumentList @('-version')
         $versionText = ($versionResult.Output | Out-String)
         $major = 0
         if ($versionText -match 'version\s+"(?<major>\d+)') { $major = [int]$Matches['major'] }
         elseif ($versionText -match '(?:openjdk|java)\s+(?<major>\d+)') { $major = [int]$Matches['major'] }
         if ($major -ge 17 -and (Test-Path -LiteralPath (Join-Path $bin 'javac.exe') -PathType Leaf)) {
-            return [pscustomobject]@{ Ready = $true; JavaHome = $home; Major = $major }
+            return [pscustomobject]@{ Ready = $true; JavaHome = $javaHomeDir; Major = $major }
         }
     }
     return [pscustomobject]@{ Ready = $false; JavaHome = ''; Major = 0 }
