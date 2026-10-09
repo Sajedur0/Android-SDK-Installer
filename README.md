@@ -21,7 +21,7 @@ Choose **3. Check Environment Paths** to check the Machine, User, and current Pr
 
 ### Android SDK install flow
 
-1. Choose **1** and paste the path to a folder, a ZIP file, or a direct URL.
+1. Choose **1** and paste the path to a folder, a ZIP file, or a direct URL. If no JDK 17+ is installed, the installer automatically installs **Eclipse Temurin JDK 17** first (no prompt): it uses `winget` when available, otherwise downloads Temurin JDK 17 from Adoptium, and sets `JAVA_HOME`.
 2. For a folder, the installer searches for files such as `commandlinetools-win-*_latest.zip`, `cmdline-tools*.zip`, and extracted `cmdline-tools` / `commandlinetools` folders. A folder containing an existing SDK layout is also supported. If several candidates are found, choose a number; pressing Enter selects the first (newest ZIPs are listed first).
 3. The selected tools are staged in a temporary folder and installed to `C:\Android\cmdline-tools\latest`. The original ZIP is never deleted. If the selected folder is an existing SDK root, its `platform-tools`, `platforms`, `build-tools`, licenses, NDK, CMake, emulator, and other SDK component folders are merged into `C:\Android` without deleting the source. Destination-only files are not deleted; files at matching paths may be refreshed from the selected source. Replaced command-line tools are kept in a timestamped backup.
 4. The installer installs **platform-tools**, **Android Platform 36**, and the latest available **Build Tools 36.x**. It also installs the latest stable **NDK** and **CMake** versions reported by the SDK package catalog when those packages are available.

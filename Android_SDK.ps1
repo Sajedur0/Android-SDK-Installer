@@ -333,11 +333,16 @@ function Get-JdkInfo {
 }
 
 function Ensure-Jdk {
+    param([switch]$AutoInstall)
     $jdk = Get-JdkInfo
     if (-not $jdk.Ready) {
-        Write-Host 'A JDK 17 or newer is required for Android builds.' -ForegroundColor Yellow
-        $answer = Read-Host 'Install Eclipse Temurin JDK 17 now? (Y/N)'
-        if ($answer -notmatch '(?i)^y(es)?$') { throw 'Install a JDK 17+ and run this installer again.' }
+        if ($AutoInstall) {
+            Write-Host 'A JDK 17 or newer is required. No suitable JDK was found, so Eclipse Temurin JDK 17 will be installed automatically.' -ForegroundColor Yellow
+        } else {
+            Write-Host 'A JDK 17 or newer is required for Android builds.' -ForegroundColor Yellow
+            $answer = Read-Host 'Install Eclipse Temurin JDK 17 now? (Y/N)'
+            if ($answer -notmatch '(?i)^y(es)?$') { throw 'Install a JDK 17+ and run this installer again.' }
+        }
         $installed = $false
         if (Get-WingetPath) {
             try {
@@ -635,7 +640,8 @@ function Install-AndroidSdk {
     Write-Host '=========================================================' -ForegroundColor Cyan
     Write-Host '         Android SDK Installation (C:\Android)          ' -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Ensure-Jdk
+    # Automatically download and install Eclipse Temurin JDK 17 when no JDK 17+ is present (no prompt).
+    Ensure-Jdk -AutoInstall
     $source = Read-AndroidSource
     if ($null -eq $source) { Write-Host 'Cancelled.' -ForegroundColor Yellow; return }
 
