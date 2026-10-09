@@ -121,10 +121,31 @@ function Set-AndroidEnvironment {
     [Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT', $script:SdkRoot, 'Machine')
     $env:ANDROID_HOME = $script:SdkRoot
     $env:ANDROID_SDK_ROOT = $script:SdkRoot
-    $cmdlineBin = Join-Path $script:SdkRoot 'cmdline-tools\latest\bin'
-    $platformTools = Join-Path $script:SdkRoot 'platform-tools'
-    if (Test-Path -LiteralPath $cmdlineBin -PathType Container) { Add-PathEntry $cmdlineBin 'Machine' }
-    if (Test-Path -LiteralPath $platformTools -PathType Container) { Add-PathEntry $platformTools 'Machine' }
+
+    $ndk = Get-LatestVersionFolder (Join-Path $script:SdkRoot 'ndk')
+    if ($ndk) {
+        [Environment]::SetEnvironmentVariable('ANDROID_NDK_HOME', $ndk, 'Machine')
+        $env:ANDROID_NDK_HOME = $ndk
+    }
+
+    $javaHome = $env:JAVA_HOME
+    if ([string]::IsNullOrWhiteSpace($javaHome)) { $javaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine') }
+    if ($javaHome -and (Test-Path -LiteralPath (Join-Path $javaHome 'bin') -PathType Container)) {
+        Add-PathEntry (Join-Path $javaHome 'bin') 'Machine'
+    }
+
+    $entries = @(
+        (Join-Path $script:SdkRoot 'cmdline-tools\latest\bin'),
+        (Join-Path $script:SdkRoot 'platform-tools'),
+        (Join-Path $script:SdkRoot 'emulator')
+    )
+    $buildTools = Get-LatestVersionFolder (Join-Path $script:SdkRoot 'build-tools')
+    if ($buildTools) { $entries += $buildTools }
+    $cmake = Get-LatestVersionFolder (Join-Path $script:SdkRoot 'cmake')
+    if ($cmake) { $entries += (Join-Path $cmake 'bin') }
+    foreach ($entry in $entries) {
+        if (Test-Path -LiteralPath $entry -PathType Container) { Add-PathEntry $entry 'Machine' }
+    }
 }
 
 function Grant-OriginalUserModifyAccess {
@@ -441,50 +462,6 @@ function Get-CmdlineToolsFolders {
     return @($unique)
 }
 
-function Test-AndroidSdkRootFolder {
-    param([string]$Folder)
-    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return $false }
-    foreach ($name in @('platform-tools', 'platforms', 'build-tools', 'licenses', 'ndk', 'cmake', 'emulator')) {
-        if (Test-Path -LiteralPath (Join-Path $Folder $name) -PathType Container) { return $true }
-    }
-    return $false
-}
-
-function Copy-ExistingAndroidSdkComponents {
-    param([string]$SourceRoot, [string]$TargetRoot)
-    if ([string]::IsNullOrWhiteSpace($SourceRoot) -or -not (Test-Path -LiteralPath $SourceRoot -PathType Container)) { return }
-    $source = [IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
-    $target = [IO.Path]::GetFullPath($TargetRoot).TrimEnd('\')
-    if ($source -ieq $target) { return }
-    $robocopy = Join-Path $env:SystemRoot 'System32\robocopy.exe'
-    if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) { throw 'robocopy.exe was not found; existing SDK packages could not be copied safely.' }
-    foreach ($name in @('platform-tools', 'platforms', 'build-tools', 'licenses', 'ndk', 'cmake', 'emulator', 'system-images', 'sources', 'extras')) {
-        $src = Join-Path $source $name
-        if (-not (Test-Path -LiteralPath $src -PathType Container)) { continue }
-        $dst = Join-Path $target $name
-        New-Item -ItemType Directory -Path $dst -Force | Out-Null
-        Write-Host "[*] Importing existing SDK component: $name" -ForegroundColor Yellow
-        $code = Invoke-ExternalToHost -Path $robocopy -ArgumentList @($src, $dst, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/NP', '/NFL', '/NDL')
-        if ($code -ge 8) { throw "Could not copy SDK component '$name' (robocopy exit code $code). The source was not deleted." }
-    }
-}
-
-function Get-AndroidSourcesFromFolder {
-    param([string]$Folder)
-    $sdkRoot = ''
-    if (Test-AndroidSdkRootFolder $Folder) { $sdkRoot = (Get-Item -LiteralPath $Folder).FullName }
-    $sources = @()
-    foreach ($zip in (Get-ChildItem -LiteralPath $Folder -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)(command.?line.?tools|cmdline.?tools).*\.zip$' } | Sort-Object LastWriteTime -Descending)) {
-        $sources += [pscustomobject]@{ Kind = 'Zip'; Path = $zip.FullName; Name = $zip.Name; Size = $zip.Length; SdkRoot = $sdkRoot }
-    }
-    foreach ($tools in (Get-CmdlineToolsFolders $Folder)) {
-        if (-not ($sources | Where-Object { $_.Path -ieq $tools })) {
-            $sources += [pscustomobject]@{ Kind = 'Folder'; Path = $tools; Name = "Extracted tools: $tools"; Size = 0; SdkRoot = $sdkRoot }
-        }
-    }
-    return @($sources)
-}
-
 function Get-FlutterFolders {
     param([string]$Root)
     $found = @()
@@ -516,32 +493,6 @@ function Select-SourceCandidate {
         $number = 0
         if ([int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $Candidates.Count) { return $Candidates[$number - 1] }
         Write-Host 'Invalid selection.' -ForegroundColor Red
-    }
-}
-
-function Read-AndroidSource {
-    while ($true) {
-        Write-Host 'Paste an Android SDK folder, a folder containing commandlinetools/cmdline-tools, a ZIP path, or a direct URL.' -ForegroundColor Yellow
-        Write-Host "Example: $env:USERPROFILE\Downloads" -ForegroundColor Gray
-        $value = (Read-Host 'Folder / ZIP / URL').Trim().Trim([char]'"').Trim([char]"'").Trim()
-        if ([string]::IsNullOrWhiteSpace($value)) { Write-Host 'Input cannot be empty.' -ForegroundColor Red; continue }
-        if ($value -match '^https?://') { return [pscustomobject]@{ Kind = 'Url'; Path = $value; Name = $value; Size = 0; SdkRoot = '' } }
-        if (Test-Path -LiteralPath $value -PathType Leaf) {
-            if ([IO.Path]::GetExtension($value) -ine '.zip') { Write-Host 'Select a .zip file or a folder.' -ForegroundColor Red; continue }
-            $zip = Get-Item -LiteralPath $value
-            $parent = Split-Path -Parent $zip.FullName
-            $sdkRoot = ''
-            if (Test-AndroidSdkRootFolder $parent) { $sdkRoot = $parent }
-            return [pscustomobject]@{ Kind = 'Zip'; Path = $zip.FullName; Name = $zip.Name; Size = $zip.Length; SdkRoot = $sdkRoot }
-        }
-        if (Test-Path -LiteralPath $value -PathType Container) {
-            $candidates = @(Get-AndroidSourcesFromFolder $value)
-            if ($candidates.Count -eq 0) { Write-Host 'No command-line tools ZIP or extracted tools folder was found.' -ForegroundColor Red; continue }
-            $selected = Select-SourceCandidate $candidates 'Matching Android SDK sources:'
-            if ($null -ne $selected) { return $selected }
-            continue
-        }
-        Write-Host 'Path not found. Try again.' -ForegroundColor Red
     }
 }
 
@@ -635,16 +586,55 @@ function Install-SdkPackages {
     return (Invoke-ExternalToHost -Path $SdkManager -ArgumentList $managerArgs)
 }
 
+function Get-LatestVersionFolder {
+    param([string]$Parent)
+    if (-not (Test-Path -LiteralPath $Parent -PathType Container)) { return $null }
+    $best = $null
+    $bestVersion = $null
+    foreach ($dir in (Get-ChildItem -LiteralPath $Parent -Directory -ErrorAction SilentlyContinue)) {
+        $version = [version]'0.0'
+        if (-not [version]::TryParse($dir.Name, [ref]$version)) { continue }
+        if ($null -eq $bestVersion -or $version -gt $bestVersion) { $best = $dir.FullName; $bestVersion = $version }
+    }
+    return $best
+}
+
+function Get-LatestCmdlineToolsUrl {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # Last known build, used only if the Android developer page cannot be read.
+    $fallbackBuild = '15859902'
+    $build = $null
+    Write-Host '[*] Looking up the latest Google command-line tools version...' -ForegroundColor Yellow
+    try {
+        $page = Invoke-WebRequest -UseBasicParsing -Uri 'https://developer.android.com/studio' -Headers @{ 'User-Agent' = 'Android-SDK-Installer' }
+        $hits = @([regex]::Matches([string]$page.Content, 'commandlinetools-win-(\d+)_latest\.zip'))
+        $numbers = @($hits | ForEach-Object { [long]$_.Groups[1].Value } | Sort-Object -Descending)
+        if ($numbers.Count -gt 0) { $build = [string]$numbers[0] }
+    } catch {
+        Write-Warning "Could not read the Android developer download page: $($_.Exception.Message)"
+    }
+    if (-not $build) {
+        Write-Warning "Using the fallback command-line tools build $fallbackBuild."
+        $build = $fallbackBuild
+    }
+    Write-Host "[*] Latest command-line tools build: $build" -ForegroundColor Yellow
+    return "https://dl.google.com/android/repository/commandlinetools-win-$($build)_latest.zip"
+}
+
 function Install-AndroidSdk {
     Write-Host ''
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Write-Host '         Android SDK Installation (C:\Android)          ' -ForegroundColor Cyan
+    Write-Host '        Java SDK + Android SDK Installation               ' -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
+
+    Write-Host ''
+    Write-Host '[Step 1/4] Java SDK: Eclipse Temurin JDK 17' -ForegroundColor Cyan
     # Automatically download and install Eclipse Temurin JDK 17 when no JDK 17+ is present (no prompt).
     Ensure-Jdk -AutoInstall
-    $source = Read-AndroidSource
-    if ($null -eq $source) { Write-Host 'Cancelled.' -ForegroundColor Yellow; return }
 
+    Write-Host ''
+    Write-Host '[Step 2/4] Android command-line tools (latest Google release)' -ForegroundColor Cyan
+    $toolsUrl = Get-LatestCmdlineToolsUrl
     $work = Join-Path $env:TEMP ('AndroidSdkInstaller-' + [guid]::NewGuid().ToString('N'))
     $zip = Join-Path $work 'commandlinetools.zip'
     $extract = Join-Path $work 'extract'
@@ -652,26 +642,18 @@ function Install-AndroidSdk {
     $backup = ''
     try {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
-        if ($source.Kind -eq 'Url') {
-            Write-Host '[*] Downloading command-line tools to a temporary folder...' -ForegroundColor Yellow
-            Download-File $source.Path $zip
-        } elseif ($source.Kind -eq 'Zip') {
-            Write-Host '[*] Copying the ZIP to a temporary folder. The source file will not be deleted.' -ForegroundColor Yellow
-            Copy-Item -LiteralPath $source.Path -Destination $zip -Force
-        } else { $toolsSource = $source.Path }
-
-        if ($source.Kind -ne 'Folder') {
-            if ((Get-Item -LiteralPath $zip).Length -lt 1024) { throw 'The selected file is too small to be a command-line tools ZIP.' }
-            New-Item -ItemType Directory -Path $extract -Force | Out-Null
-            Write-Host '[*] Extracting Android command-line tools...' -ForegroundColor Yellow
-            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
-            $toolsSource = Find-ExtractedAndroidTools $extract
-            if (-not $toolsSource) { throw 'The ZIP does not contain a cmdline-tools folder with sdkmanager.bat or android.exe.' }
-        }
+        Write-Host '[*] Downloading Android command-line tools...' -ForegroundColor Yellow
+        Download-File $toolsUrl $zip
+        if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The command-line tools download is too small to be a valid archive.' }
+        New-Item -ItemType Directory -Path $extract -Force | Out-Null
+        Write-Host '[*] Extracting Android command-line tools...' -ForegroundColor Yellow
+        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+        $toolsSource = Find-ExtractedAndroidTools $extract
+        if (-not $toolsSource) { throw 'The downloaded ZIP does not contain a cmdline-tools folder with sdkmanager.bat or android.exe.' }
 
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
         Get-ChildItem -LiteralPath $toolsSource -Force | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force }
-        if (-not (Test-CmdlineToolsDirectory $stage)) { throw 'The selected folder does not contain usable Android command-line tools.' }
+        if (-not (Test-CmdlineToolsDirectory $stage)) { throw 'The downloaded folder does not contain usable Android command-line tools.' }
 
         $toolsRoot = Join-Path $script:SdkRoot 'cmdline-tools'
         $latest = Join-Path $toolsRoot 'latest'
@@ -688,10 +670,11 @@ function Install-AndroidSdk {
         }
 
         New-Item -ItemType Directory -Path $script:SdkRoot -Force | Out-Null
-        if ($source.SdkRoot) { Copy-ExistingAndroidSdkComponents $source.SdkRoot $script:SdkRoot }
         Grant-OriginalUserModifyAccess $script:SdkRoot
         Set-AndroidEnvironment
 
+        Write-Host ''
+        Write-Host '[Step 3/4] Android SDK packages' -ForegroundColor Cyan
         $bin = Join-Path $latest 'bin'
         $sdkManager = Join-Path $bin 'sdkmanager.bat'
         $androidCli = Join-Path $bin 'android.exe'
@@ -724,11 +707,7 @@ function Install-AndroidSdk {
             $nativeCode = Install-SdkPackages $sdkManager $androidCli $script:SdkRoot $native
             if ($nativeCode -ne 0) { Write-Warning "Core packages are installed, but native packages failed: $($native -join ', ') (exit code $nativeCode)." }
         } else {
-            $existingNative = @()
-            if (Test-Path -LiteralPath (Join-Path $script:SdkRoot 'ndk') -PathType Container) { $existingNative += 'NDK' }
-            if (Test-Path -LiteralPath (Join-Path $script:SdkRoot 'cmake') -PathType Container) { $existingNative += 'CMake' }
-            if ($existingNative.Count -gt 0) { Write-Host "Existing native tool folders found: $($existingNative -join ', ')" -ForegroundColor Gray }
-            else { Write-Warning 'The SDK package catalog did not provide stable NDK/CMake versions; native plugins may require installing them later.' }
+            Write-Warning 'The SDK package catalog did not provide stable NDK/CMake versions; native plugins may require installing them later.'
         }
 
         $required = @(
@@ -739,18 +718,20 @@ function Install-AndroidSdk {
         $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
         if ($missing.Count -gt 0) { throw "SDK verification failed. Missing: $($missing -join ', ')" }
 
-        Add-PathEntry $bin 'Machine'
-        Add-PathEntry (Join-Path $script:SdkRoot 'platform-tools') 'Machine'
+        Write-Host ''
+        Write-Host '[Step 4/4] Setting environment variables and PATH entries' -ForegroundColor Cyan
+        Set-AndroidEnvironment
         Broadcast-EnvironmentChange
         Write-Host ''
         Write-Host '=========================================================' -ForegroundColor Cyan
-        Write-Host 'ANDROID SDK INSTALLATION VERIFIED' -ForegroundColor Green
+        Write-Host 'JAVA + ANDROID SDK INSTALLATION VERIFIED' -ForegroundColor Green
         Write-Host '=========================================================' -ForegroundColor Cyan
+        Write-Host "JAVA_HOME: $([Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine'))"
         Write-Host "SDK root: $script:SdkRoot"
-        Write-Host 'Installed: command-line tools, platform-tools, Android API 36, and Build Tools.'
+        Write-Host "Installed: Temurin JDK 17, command-line tools (build $(Split-Path -Leaf $toolsUrl)), platform-tools, Android API 36, and Build Tools."
         if ($nativeCode -eq 0) { Write-Host "Installed NDK/CMake: $($native -join ', ')" }
         if ($backup) { Write-Host "Previous command-line tools backup: $backup" -ForegroundColor Gray }
-        Write-Host 'ANDROID_HOME, ANDROID_SDK_ROOT, and Machine PATH have been configured.' -ForegroundColor Green
+        Write-Host 'JAVA_HOME, ANDROID_HOME, ANDROID_SDK_ROOT, and Machine PATH have been configured.' -ForegroundColor Green
         Write-Host 'Open a new terminal before building.' -ForegroundColor Yellow
     } finally {
         if (Test-Path -LiteralPath $work -PathType Container) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
@@ -1052,7 +1033,7 @@ while ($true) {
     Write-Host '       Android SDK & Flutter Installer for Windows       ' -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  1. Android SDK Installation (C:\Android)' -ForegroundColor Yellow
+    Write-Host '  1. Java SDK + Android SDK Installation (JDK 17 & C:\Android)' -ForegroundColor Yellow
     Write-Host '  2. Flutter Installation (C:\flutter)' -ForegroundColor Yellow
     Write-Host '  3. Check Environment Paths' -ForegroundColor Yellow
     Write-Host ''
