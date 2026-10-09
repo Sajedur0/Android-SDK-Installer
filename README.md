@@ -1,213 +1,89 @@
-# Android SDK Guide
+# Android SDK & Flutter Installer for Windows
 
-### Set up Android SDK on Windows — Without Installing Android Studio
+A PowerShell 5.1+ installer for Windows 10/11. It installs the Android SDK under `C:\Android` and Flutter under `C:\flutter`, without requiring the Android Studio IDE. The installer requests Administrator privileges because it updates Machine environment variables and installs under the root of `C:`.
 
 ---
 
-## 🇬🇧 English
+## English
 
-### What is this?
+### Menu options
 
-A PowerShell script that **automatically installs and configures the Android SDK** on Windows **without needing Android Studio**. Just provide the cmdline-tools ZIP (from a local folder or direct download link), and the script handles everything — extraction, installing platform-tools, setting environment variables, and accepting licenses.
+- **1. Android SDK Installation** — select a local command-line-tools ZIP, an extracted tools folder, or a direct download URL. The SDK packages are installed to `C:\Android`.
+- **2. Flutter Installation** — select a Flutter ZIP, an extracted Flutter SDK folder, or a direct download URL. Flutter is installed to `C:\flutter`.
+- **3. Check Environment Paths** — inspect Java/JDK, Python, Android SDK, and Flutter environment variables, PATH entries, and required executables. This check is read-only.
+- **0. Exit** — close the installer.
 
-### Why would I need this?
+Double-click `Run.bat` to open the menu. PowerShell asks for Administrator approval before the installer changes Machine environment variables.
 
-- You want to use **Flutter**, **React Native**, **Cordova**, or other frameworks that require Android SDK
-- You don't want to install the full Android Studio (2+ GB) just for the SDK
-- You need **ADB (Android Debug Bridge)** for debugging or managing Android devices
-- You want a **clean, minimal SDK setup** without extra clutter
-- You need to **quickly set up or reset** the SDK on a new machine
+### Environment path check
 
-### What does this script do?
+Choose **3. Check Environment Paths** to check the Machine, User, and current Process scopes. The read-only check reports `JAVA_HOME` and JDK executables, Python executables or the `py` launcher, Android SDK variables and tools, `FLUTTER_ROOT`, and whether their expected directories are in `PATH`. Python is checked only; this installer does not install it. Open a new terminal after a Machine or User PATH change.
 
-| Step | What happens |
-|---|---|
-| 1. Input | You provide a **folder path** or **download URL** for cmdline-tools |
-| 2. Cleanup | Removes any previous `C:\Android` folder (fast) |
-| 3. Extract | Extracts the ZIP into `cmdline-tools\latest\bin` |
-| 4. SDK Install | Runs `sdkmanager` to install **platform-tools**, **platforms;android-34**, **build-tools;34.0.0** |
-| 5. Env Variables | Sets `ANDROID_HOME` (Machine) and updates `PATH` (User) |
-| 6. Licenses | Runs `sdkmanager --licenses` — you accept manually with y/n |
-| 7. Verify | Shows `sdkmanager --version` and `adb --version` |
+### Android SDK install flow
 
-### What gets installed to `C:\Android`?
+1. Choose **1** and paste the path to a folder, a ZIP file, or a direct URL.
+2. For a folder, the installer searches for files such as `commandlinetools-win-*_latest.zip`, `cmdline-tools*.zip`, and extracted `cmdline-tools` / `commandlinetools` folders. A folder containing an existing SDK layout is also supported. If several candidates are found, choose a number; pressing Enter selects the first (newest ZIPs are listed first).
+3. The selected tools are staged in a temporary folder and installed to `C:\Android\cmdline-tools\latest`. The original ZIP is never deleted. If the selected folder is an existing SDK root, its `platform-tools`, `platforms`, `build-tools`, licenses, NDK, CMake, emulator, and other SDK component folders are merged into `C:\Android` without deleting the source. Destination-only files are not deleted; files at matching paths may be refreshed from the selected source. Replaced command-line tools are kept in a timestamped backup.
+4. The installer installs **platform-tools**, **Android Platform 36**, and the latest available **Build Tools 36.x**. It also installs the latest stable **NDK** and **CMake** versions reported by the SDK package catalog when those packages are available.
+5. SDK license prompts are interactive. Read each prompt and enter `y` to accept. The installer does not silently accept third-party license agreements.
+6. It verifies the required files (`adb.exe`, `android.jar`, and `aapt2.exe`) before reporting success.
 
-```
-C:\Android\
-├── cmdline-tools\latest\bin\     ← sdkmanager, avdmanager, etc.
-├── platform-tools\               ← adb, fastboot
-├── platforms\android-34\         ← Android SDK Platform 34
-└── build-tools\34.0.0\           ← aapt, dx, zipalign, etc.
-```
+The Android Emulator and system images are not downloaded as new packages by default. If they already exist in the selected SDK root, they are copied over; otherwise, they are optional and not required just to compile an Android app. Install them separately if you want to run a virtual device.
 
-### Environment Variables (set automatically)
+### Flutter install flow
 
-| Variable | Value | Scope | Purpose |
-|---|---|---|---|
-| `ANDROID_HOME` | `C:\Android` | Machine | Tells tools where the SDK is |
-| `PATH` (append) | `C:\Android\cmdline-tools\latest\bin` | User | Run `sdkmanager` from anywhere |
-| `PATH` (append) | `C:\Android\platform-tools` | User | Run `adb` from anywhere |
-| `JDK_JAVA_OPTIONS` | `--enable-native-access=ALL-UNNAMED` | Machine | Suppress Java warnings |
+1. Choose **2** and paste a folder, ZIP path, or direct URL. The folder search accepts `flutter*.zip` and already-extracted Flutter SDK folders.
+2. Flutter is staged before replacing `C:\flutter`; any previous installation is preserved in a timestamped backup. The selected source file is not deleted.
+3. The installer checks for a **JDK 17+** and **Git for Windows**. If either is missing, it offers to install Temurin JDK 17 or Git using `winget`. Review and approve the package installer terms if prompted.
+4. Flutter's `bin` is added to Machine `PATH`. If Android Platform 36 is installed under `C:\Android`, the installer sets Flutter's Android SDK path and runs the Android license check and `flutter doctor -v`.
 
-### How to use
+### Environment variables
 
-**Step 1 — Get the cmdline-tools ZIP**
+The installer sets these at Machine scope and updates the current installer session:
 
-- **Option A (Online):** Get the latest URL from [Android Studio Download Page](https://developer.android.com/studio#command-line-tools-only) (look for "Command line tools only")
-- **Option B (Offline):** If you already downloaded the ZIP, note its folder path
+| Variable / PATH entry | Value | Purpose |
+|---|---|---|
+| `ANDROID_HOME` | `C:\Android` | Android SDK location recommended by Android tooling |
+| `ANDROID_SDK_ROOT` | `C:\Android` | Compatibility with tools that still read the deprecated variable; kept equal to `ANDROID_HOME` |
+| `JAVA_HOME` | Detected JDK 17+ location | JDK used by Gradle and Android builds |
+| `FLUTTER_ROOT` | `C:\flutter` | Flutter SDK location |
+| `PATH` | Android command-line tools, `platform-tools`, JDK `bin`, and `C:\flutter\bin` when installed | Run `sdkmanager`, `adb`, `java`, `git`, and `flutter` from a terminal |
 
-**Step 2 — Run the installer**
+Open a **new terminal** after installation so it receives the updated environment.
 
-Double-click **`Run.bat`** (recommended) or run in PowerShell:
+### Requirements and notes
+
+- Windows 10 or Windows 11; Windows PowerShell 5.1 or later.
+- Administrator approval is required for the C-drive installs, Machine PATH, and system environment variables.
+- Internet is required to fetch SDK packages and optional Winget prerequisites.
+- Allow several GB of free disk space, especially when installing the NDK and CMake.
+- The installer does not delete an existing `C:\Android` SDK or the source ZIP. It preserves previous `latest` command-line tools and Flutter installations in timestamped backups.
+- The official `sdkmanager` tool is deprecated by Google. If an Android CLI executable is present, the installer uses `android sdk install`; otherwise it uses the compatible `sdkmanager.bat` interface.
+
+### Verify
+
+Open a new PowerShell or Command Prompt and run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
+java -version
+git --version
+adb version
+flutter doctor -v
 ```
 
-**Step 3 — Provide input**
+For the SDK package list, use `android sdk list` if the Android CLI is installed, or `sdkmanager --list` otherwise.
 
-```
-Enter Directory Address (folder path) OR Online Direct File Link (URL):
-Example: C:\Users\%USERNAME%\Downloads   or   https://dl.google.com/...
+---
 
-Address / URL:
-```
-
-Give any one of these:
-
-| Input Type | Example |
-|---|---|
-| Online URL | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` |
-| Directory (auto-scan) | `C:\Users\%USERNAME%\Downloads` |
-| File path (direct) | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` |
-
-**Step 4 — Accept licenses**
-
-When prompted, type `y` + Enter for each license shown.
-
-**Step 5 — Done!**
-
-Close the window and open a new Terminal. Run `adb --version` and `sdkmanager --list` to verify.
-
-### System Requirements
-
-- **OS:** Windows 10 / Windows 11
-- **PowerShell:** 5.1 or later
-- **Internet:** Needed for online download + SDK packages
-- **Java:** JDK 17+ (sdkmanager requires Java)
-
-### Files
+## Repository files
 
 | File | Purpose |
 |---|---|
-| `Android_SDK.ps1` | Main PowerShell installer |
-| `Run.bat` | Double-click launcher (auto admin + bypass policy) |
-| `README.md` | This documentation |
-
----
-
-## 🇧🇩 বাংলা
-
-### এটা কী?
-
-একটি PowerShell স্ক্রিপ্ট যা **Android Studio ছাড়াই Windows-এ Android SDK সম্পূর্ণরূপে ইনস্টল ও কনফিগার করে**। আপনি শুধু cmdline-tools-এর ZIP ফাইলটির লোকেশন বা ডাউনলোড লিংক দিবেন, বাকি সব — এক্সট্র্যাক্ট করা, platform-tools ইনস্টল করা, এনভায়রনমেন্ট ভেরিয়েবল সেট করা, লাইসেন্স অ্যাকসেপ্ট করা — স্ক্রিপ্ট নিজেই করে ফেলে।
-
-### কেন দরকার?
-
-- **Flutter**, **React Native**, **Cordova** ইত্যাদি ফ্রেমওয়ার্ক ব্যবহার করতে Android SDK লাগে
-- শুধুমাত্র SDK-এর জন্য **পুরো Android Studio (২+ GB)** ইনস্টল করতে চান না
-- Android ডিভাইস ম্যানেজ বা ডিবাগ করতে **ADB** দরকার
-- একটি **পরিষ্কার ও মিনিমাল SDK সেটআপ** চান
-- নতুন কম্পিউটারে **দ্রুত SDK সেটআপ** করতে চান
-
-### স্ক্রিপ্টটি কী কী করে?
-
-| ধাপ | কী হয় |
-|---|---|
-| ১. ইনপুট | আপনি cmdline-tools-এর **ফোল্ডার পাথ** বা **ডাউনলোড URL** দেন |
-| ২. ক্লিনআপ | আগের `C:\Android` ফোল্ডার থাকলে দ্রুত ডিলিট করে |
-| ৩. এক্সট্র্যাক্ট | ZIP ফাইলকে `cmdline-tools\latest\bin` স্ট্রাকচারে এক্সট্র্যাক্ট করে |
-| ৪. SDK ইনস্টল | `sdkmanager` দিয়ে **platform-tools**, **platforms;android-34**, **build-tools;34.0.0** ইনস্টল করে |
-| ৫. এনভায়রনমেন্ট | `ANDROID_HOME` (Machine) সেট করে এবং `PATH` (User) আপডেট করে |
-| ৬. লাইসেন্স | `sdkmanager --licenses` রান করে — আপনি manually y/n দেন |
-| ৭. ভেরিফাই | শেষে `sdkmanager --version` ও `adb --version` দেখায় |
-
-### `C:\Android`-এ কী কী ইনস্টল হয়?
-
-```
-C:\Android\
-├── cmdline-tools\latest\bin\     ← sdkmanager, avdmanager, ইত্যাদি
-├── platform-tools\               ← adb, fastboot
-├── platforms\android-34\         ← Android SDK Platform 34
-└── build-tools\34.0.0\           ← aapt, dx, zipalign, ইত্যাদি
-```
-
-### এনভায়রনমেন্ট ভেরিয়েবল (অটো সেট হয়)
-
-| ভেরিয়েবল | ভ্যালু | স্কোপ | উদ্দেশ্য |
-|---|---|---|---|
-| `ANDROID_HOME` | `C:\Android` | Machine | টুলসকে SDK-এর লোকেশন জানায় |
-| `PATH` (যোগ) | `C:\Android\cmdline-tools\latest\bin` | User | যেকোনো জায়গা থেকে `sdkmanager` চালানো |
-| `PATH` (যোগ) | `C:\Android\platform-tools` | User | যেকোনো জায়গা থেকে `adb` চালানো |
-| `JDK_JAVA_OPTIONS` | `--enable-native-access=ALL-UNNAMED` | Machine | Java ওয়ার্নিং বন্ধ করে |
-
-### ব্যবহার বিধি
-
-**ধাপ ১ — cmdline-tools-এর ZIP সংগ্রহ করুন**
-
-- **অনলাইন:** [Android Studio Download Page](https://developer.android.com/studio#command-line-tools-only) থেকে লেটেস্ট লিংক নিন ("Command line tools only" সেকশন)
-- **অফলাইন:** আগে থেকে ডাউনলোড করা থাকলে ফোল্ডার পাথ নোট করে রাখুন
-
-**ধাপ ২ — ইন্সটলার রান করুন**
-
-`Run.bat`-এ **ডাবল-ক্লিক** করুন (সুপারিশকৃত) অথবা PowerShell-এ রান করুন:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "Android_SDK.ps1"
-```
-
-**ধাপ ৩ — ইনপুট দিন**
-
-```
-Enter Directory Address (folder path) OR Online Direct File Link (URL):
-Example: C:\Users\%USERNAME%\Downloads   or   https://dl.google.com/...
-
-Address / URL:
-```
-
-নিচের যেকোনো একটি দিন:
-
-| ইনপুট টাইপ | উদাহরণ |
-|---|---|
-| অনলাইন URL | `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` |
-| ডিরেক্টরি (অটো-স্ক্যান) | `C:\Users\%USERNAME%\Downloads` |
-| ফাইল পাথ (সরাসরি) | `C:\Users\%USERNAME%\Downloads\cmdline-tools.zip` |
-
-**ধাপ ৪ — লাইসেন্স অ্যাকসেপ্ট করুন**
-
-প্রতিটি লাইসেন্সের জন্য `y` + Enter দিন।
-
-**ধাপ ৫ — শেষ!**
-
-উইন্ডো বন্ধ করে নতুন Terminal খুলুন। `adb --version` এবং `sdkmanager --list` দিয়ে ভেরিফাই করুন।
-
-### সিস্টেম প্রয়োজনীয়তা
-
-- **OS:** Windows 10 / Windows 11
-- **PowerShell:** 5.1 বা তার পরের
-- **ইন্টারনেট:** অনলাইন ডাউনলোড ও SDK প্যাকেজের জন্য প্রয়োজন
-- **Java:** JDK 17+ (sdkmanager চালানোর জন্য)
-
-### ফাইলসমূহ
-
-| ফাইল | উদ্দেশ্য |
-|---|---|
-| `Android_SDK.ps1` | মূল PowerShell ইন্সটলার স্ক্রিপ্ট |
-| `Run.bat` | ডাবল-ক্লিক লঞ্চার (অটো অ্যাডমিন + বাইপাস পলিসি) |
-| `README.md` | এই ডকুমেন্টেশন |
-
----
+| `Android_SDK.ps1` | Main installer and menu |
+| `Run.bat` | Launcher; PowerShell handles UAC elevation |
+| `.gitattributes` | Keeps Windows batch files on CRLF line endings |
+| `README.md` | This guide |
 
 ## License
 
-**Apache License 2.0**
+Apache License 2.0. See [`LICENSE`](LICENSE).
