@@ -41,7 +41,8 @@ $wanted = @(
     'Test-InlineProgressSupported', 'Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock',
     'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
     'Get-SmoothedSpeed', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
-    'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress'
+    'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress',
+    'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles'
 )
 $definitions = $ast.FindAll({
         param($node)
@@ -241,6 +242,57 @@ try { Download-File 'https://raw.githubusercontent.com/Sajedur0/Android-SDK-Inst
 catch { $failed = $true }
 Assert-True $failed 'A 404 download raises an error'
 Assert-True (-not (Test-Path -LiteralPath $failedTarget)) 'A failed download leaves no partial file'
+
+# --- 8. Android SDK license helpers -------------------------------------------
+Write-Host "`n[8] Android SDK license helpers" -ForegroundColor Yellow
+
+# The answer sheet feeds one answer per prompt, so a captured or piped run never stalls.
+Assert-Equal 40 @(Get-SdkLicenseAnswers 'y').Count 'Answer sheet covers plenty of prompts'
+Assert-Equal 'y' (@(Get-SdkLicenseAnswers 'y')[0]) 'Answer sheet can accept licenses'
+Assert-Equal 3 @(Get-SdkLicenseAnswers 'n' 3).Count 'Answer sheet honors the requested count'
+Assert-Equal 'n' (@(Get-SdkLicenseAnswers 'n' 3)[2]) 'Answer sheet can decline licenses'
+
+# sdkmanager reports acceptance in text, which is more reliable than its exit code.
+Assert-Equal 'Accepted' (Get-SdkLicenseStatusFromText 'All SDK package licenses accepted.') 'Success text is recognized'
+Assert-Equal 'NotAccepted' (Get-SdkLicenseStatusFromText '8 of 8 SDK package licenses not accepted.') 'Unaccepted licenses are recognized'
+Assert-Equal 'Accepted' (Get-SdkLicenseStatusFromText '0 of 8 SDK package licenses not accepted.') 'Nothing pending counts as accepted'
+Assert-Equal 'NotAccepted' (Get-SdkLicenseStatusFromText "Loading local repository...`n2 of 8 SDK package licenses not accepted.") 'The summary is found after other output'
+$colored = 'Computing updates... ' + [string][char]27 + '[32mAll SDK package licenses accepted.' + [string][char]27 + '[0m'
+Assert-Equal 'Accepted' (Get-SdkLicenseStatusFromText $colored) 'ANSI colors do not hide the result'
+Assert-Equal 'Unknown' (Get-SdkLicenseStatusFromText 'Computing updates...') 'Unrelated output stays unknown'
+Assert-Equal 'Unknown' (Get-SdkLicenseStatusFromText '') 'Empty output stays unknown'
+Assert-Equal 'Unknown' (Get-SdkLicenseStatusFromText $null) 'Missing output stays unknown'
+
+$hashes = Get-SdkLicenseFileHashes
+Assert-True ($hashes.Keys -contains 'android-sdk-license') 'The main SDK license is covered'
+Assert-True ($hashes.Keys -contains 'android-sdk-preview-license') 'The preview license is covered'
+foreach ($name in $hashes.Keys) {
+    Assert-True (@($hashes[$name]).Count -ge 1) "License $name has at least one hash"
+    foreach ($hash in $hashes[$name]) { Assert-True ($hash -match '^[0-9a-f]{40}$') "License $name hash is SHA-1 hex" }
+}
+
+# The fallback writes real files under <SDK root>\licenses and keeps hashes already on disk.
+$sdkRoot = Join-Path $work 'sdk-root'
+Write-SdkLicenseFiles -SdkRoot $sdkRoot
+$licenseFile = Join-Path $sdkRoot 'licenses\android-sdk-license'
+Assert-True (Test-Path -LiteralPath $licenseFile) 'The SDK license file is written'
+Assert-True (@(Get-Content -LiteralPath $licenseFile) -contains $hashes['android-sdk-license'][0]) 'Published hashes are written'
+$kept = 'ffffffffffffffffffffffffffffffffffffffff'
+Set-Content -LiteralPath $licenseFile -Value $kept -Encoding Ascii
+Write-SdkLicenseFiles -SdkRoot $sdkRoot
+$licenseLines = @(Get-Content -LiteralPath $licenseFile)
+Assert-True ($licenseLines -contains $kept) 'A hash already on disk is kept'
+Assert-True ($licenseLines -contains $hashes['android-sdk-license'][0]) 'Published hashes are added next to it'
+Assert-True (Test-Path -LiteralPath (Join-Path $sdkRoot 'licenses\google-gdk-license')) 'Every published license file is written'
+
+# Regression guard: license prompts must reach the console instead of a PowerShell pipeline,
+# otherwise sdkmanager hides "Accept? (y/N)" and every license defaults to "no".
+$scriptText = Get-Content -LiteralPath $scriptPath -Raw
+Assert-True ($scriptText -notmatch 'Invoke-ExternalToHost[^\r\n]*--licenses') 'License prompts are not piped through PowerShell'
+Assert-True ($scriptText -match 'function Invoke-ExternalInteractive') 'A console-attached runner is defined'
+Assert-True ($scriptText -match 'Invoke-ExternalInteractive -Path \$SdkManager -ArgumentList \$licenseArgs') 'Licenses run with the console attached'
+Assert-True ($scriptText -match '\$licenseArgs = @\("--sdk_root=') 'The license arguments point at --licenses'
+Assert-True ($scriptText -notmatch '\|\s*Out-Host') 'Native output is no longer sent through Out-Host'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
