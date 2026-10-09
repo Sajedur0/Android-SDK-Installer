@@ -6,6 +6,8 @@ $ErrorActionPreference = 'Stop'
 $script:SdkRoot = 'C:\Android'
 $script:FlutterRoot = 'C:\flutter'
 $script:OriginalUserSid = $OriginalUserSid
+# True while an inline (single-line, redrawn) progress bar owns the current console line.
+$script:InlineProgressActive = $false
 
 # Remember the signed-in user's SID before UAC so C:\ installs remain usable by that user.
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -252,11 +254,11 @@ function Install-TemurinJdkFromAdoptium {
     try {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         Write-Host "[*] Downloading Eclipse Temurin JDK 17 ($adoptiumArch) from Adoptium..." -ForegroundColor Yellow
-        Download-File $url $zip
+        Download-File $url $zip 'Eclipse Temurin JDK 17'
         if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The Temurin JDK download is too small to be a valid archive.' }
         New-Item -ItemType Directory -Path $extract -Force | Out-Null
         Write-Host '[*] Extracting Eclipse Temurin JDK 17...' -ForegroundColor Yellow
-        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+        Expand-ArchiveWithProgress -LiteralPath $zip -DestinationPath $extract -Label 'Eclipse Temurin JDK 17'
         $jdkFolder = Find-ExtractedJdkHome $extract
         if (-not $jdkFolder) { throw 'The Temurin archive did not contain a JDK with java.exe and javac.exe.' }
 
@@ -297,7 +299,7 @@ function Install-GitFromGitHub {
     try {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         Write-Host "[*] Downloading $($asset.name)..." -ForegroundColor Yellow
-        Download-File $asset.browser_download_url $setup
+        Download-File $asset.browser_download_url $setup $asset.name
         if ((Get-Item -LiteralPath $setup).Length -lt 1048576) { throw 'The Git installer download is too small to be valid.' }
         Write-Host '[*] Installing Git for Windows...' -ForegroundColor Yellow
         $setupArgs = '/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /COMPONENTS=gitlfs,assoc,assoc_sh /o:PathOption=Cmd'
@@ -525,15 +527,488 @@ function Read-FlutterSource {
     }
 }
 
-function Download-File {
-    param([string]$Url, [string]$Destination)
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# ---------------------------------------------------------------------------
+# Transfer progress: one live bar for every download and extraction, showing
+# percentage, MB moved, MB/second, elapsed time, and time remaining.
+# Set ANDROID_SDK_INSTALLER_NO_PROGRESS=1 to keep the old silent behaviour.
+# ---------------------------------------------------------------------------
+
+function Test-InlineProgressSupported {
+    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return $false }
+    if ($Host.Name -like '*ISE*') { return $false }
+    try { if ([Console]::IsOutputRedirected) { return $false } } catch { return $false }
+    try {
+        $ui = $Host.UI.RawUI
+        if ($null -eq $ui) { return $false }
+        $null = $ui.WindowSize
+        return $true
+    } catch { return $false }
+}
+
+function Get-ProgressLineWidth {
+    $width = 0
+    try { $width = $Host.UI.RawUI.WindowSize.Width } catch { $width = 0 }
+    if ($width -le 0) { try { $width = [Console]::WindowWidth } catch { $width = 0 } }
+    if ($width -le 0) { $width = 120 }
+    if ($width -gt 240) { $width = 240 }
+    return $width
+}
+
+function Format-ByteSize {
+    param([double]$Bytes)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if ([double]::IsNaN($Bytes) -or [double]::IsInfinity($Bytes) -or ($Bytes -lt 0)) { return 'unknown' }
+    if ($Bytes -ge 1073741824) { return ($Bytes / 1073741824).ToString('0.00', $inv) + ' GB' }
+    if ($Bytes -ge 1048576) { return ($Bytes / 1048576).ToString('0.0', $inv) + ' MB' }
+    if ($Bytes -ge 1024) { return ($Bytes / 1024).ToString('0', $inv) + ' KB' }
+    return ([Math]::Round($Bytes)).ToString('0', $inv) + ' B'
+}
+
+function Format-DurationClock {
+    param([double]$Seconds)
+    if ($Seconds -lt 0 -or [double]::IsNaN($Seconds) -or [double]::IsInfinity($Seconds)) { return '--:--' }
+    $span = [TimeSpan]::FromSeconds($Seconds)
+    if ($span.TotalHours -ge 1) { return ('{0}:{1:00}:{2:00}' -f [int][Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds) }
+    return ('{0:00}:{1:00}' -f [int][Math]::Floor($span.TotalMinutes), $span.Seconds)
+}
+
+function Show-TransferProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Activity,
+        [Parameter(Mandatory = $true)][double]$ReceivedBytes,
+        [double]$TotalBytes = 0,
+        [double]$BytesPerSecond = 0,
+        [double]$ElapsedSeconds = 0,
+        [double]$RemainingSeconds = -1,
+        [string]$Counter = '',
+        [switch]$Completed
+    )
+    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return }
+    if ($TotalBytes -lt 0) { $TotalBytes = 0 }
+    if ($ReceivedBytes -lt 0) { $ReceivedBytes = 0 }
+    if ($BytesPerSecond -lt 0) { $BytesPerSecond = 0 }
+    if ($ElapsedSeconds -lt 0) { $ElapsedSeconds = 0 }
+    $known = $TotalBytes -gt 0
+    $fraction = if ($known) { [Math]::Min(1, $ReceivedBytes / $TotalBytes) } else { -1 }
+    if ($Completed) { $fraction = 1 }
+
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $percentText = if ($fraction -ge 0) { ($fraction * 100).ToString('0.0', $inv) + '%' } else { '?' }
+    $receivedText = Format-ByteSize $ReceivedBytes
+    $totalText = if ($known) { Format-ByteSize $TotalBytes } else { 'unknown' }
+    $speedText = (Format-ByteSize $BytesPerSecond) + '/s'
+    $elapsedText = Format-DurationClock $ElapsedSeconds
+    $leftText = Format-DurationClock $RemainingSeconds
+
+    # Fixed-width fields keep the text the same length on every frame, so the bar
+    # does not jitter while it is redrawn in place.
+    $width = Get-ProgressLineWidth
+    if ($width -lt 76) {
+        $detail = ('{0,5} {1,9}/{2,9} {3,9} {4,7}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+    } elseif ($width -lt 112) {
+        $detail = ('{0,5}  {1,9} / {2,-10} {3,10}  {4,7} left' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+    } elseif ($Counter) {
+        # The file/item counter is more useful than the elapsed clock on busy steps.
+        $detail = ('{0,6}  {1,10} / {2,-10}  {3,10}  left {4}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+    } else {
+        $detail = ('{0,6}  {1,10} / {2,-10}  {3,10}  elapsed {4}  left {5}' -f $percentText, $receivedText, $totalText, $speedText, $elapsedText, $leftText)
+    }
+    if ($Counter) {
+        $withCounter = "$detail  ($Counter)"
+        if ((($width - 1) - 7 - $withCounter.Length) -ge 8) { $detail = $withCounter }
+    }
+    $barWidth = ($width - 1) - 7 - $detail.Length
+    if ($barWidth -lt 8) { $barWidth = 8 }
+    if ($barWidth -gt 42) { $barWidth = 42 }
+    $compact = $width -lt 112
+
+    if (-not (Test-InlineProgressSupported)) {
+        # Hosts without a real console line (ISE, redirected logs, remoting) get the
+        # native PowerShell progress bar with the same numbers in its status text.
+        $status = ($detail -replace '\s{2,}', ' ').Trim()
+        if ($Counter -and $compact) { $status += " ($Counter)" }
+        $percent = if ($fraction -ge 0) { [Math]::Min(100, [int][Math]::Floor($fraction * 100)) } else { -1 }
+        try { Write-Progress -Activity $Activity -Status $status -PercentComplete $percent } catch { }
+        if ($Completed) { try { Write-Progress -Activity $Activity -Completed } catch { } }
+        return
+    }
+
+    # 7 = '    [' + '] ' frame around the bar; the line is padded so the redraw never wraps.
+    $budget = ($width - 1) - 7 - $barWidth
+    if ($budget -lt 8) { $budget = 8 }
+    if ($detail.Length -gt $budget) { $detail = $detail.Substring(0, $budget) }
+    $detail = $detail.PadRight($budget)
+
+    $barColor = if ($Completed) { 'Green' } else { 'Cyan' }
+    Write-Host "`r    [" -NoNewline -ForegroundColor DarkGray
+    if ($fraction -ge 0) {
+        $filled = [int][Math]::Round($fraction * $barWidth)
+        if ($filled -lt 0) { $filled = 0 }
+        if ($filled -gt $barWidth) { $filled = $barWidth }
+        # Keep at least one block visible as soon as the transfer has started.
+        if (($filled -eq 0) -and ($ReceivedBytes -gt 0) -and (-not $Completed)) { $filled = 1 }
+        Write-Host ('#' * $filled) -NoNewline -ForegroundColor $barColor
+        Write-Host ('-' * ($barWidth - $filled)) -NoNewline -ForegroundColor DarkGray
+    } else {
+        # Size unknown: slide a marker so the bar still shows movement and speed.
+        $marker = [Math]::Min(3, $barWidth)
+        $span = [Math]::Max(1, $barWidth - $marker)
+        $position = [int][Math]::Floor($ElapsedSeconds * 4) % $span
+        Write-Host ('-' * $position) -NoNewline -ForegroundColor DarkGray
+        Write-Host ('#' * $marker) -NoNewline -ForegroundColor Yellow
+        Write-Host ('-' * [Math]::Max(0, $barWidth - $position - $marker)) -NoNewline -ForegroundColor DarkGray
+    }
+    Write-Host ('] ' + $detail) -NoNewline -ForegroundColor Gray
+    Write-Host "`r" -NoNewline
+    $script:InlineProgressActive = $true
+}
+
+function Close-InlineProgressLine {
+    if ($script:InlineProgressActive) {
+        $script:InlineProgressActive = $false
+        Write-Host ''
+    }
+}
+
+function Reset-TransferProgress {
+    param([Parameter(Mandatory = $true)][string]$Activity)
+    Close-InlineProgressLine
+    try { Write-Progress -Activity $Activity -Completed } catch { }
+}
+
+function Complete-TransferProgress {
+    param([Parameter(Mandatory = $true)][string]$Activity, [string]$Summary)
+    Close-InlineProgressLine
+    try { Write-Progress -Activity $Activity -Completed } catch { }
+    if (-not [string]::IsNullOrWhiteSpace($Summary)) { Write-Host "    [+] $Summary" -ForegroundColor Green }
+}
+
+function Get-SmoothedSpeed {
+    param([double]$CurrentSmoothedSpeed, [double]$InstantSpeed)
+    if ($InstantSpeed -le 0) { return $CurrentSmoothedSpeed }
+    if ($CurrentSmoothedSpeed -le 0) { return $InstantSpeed }
+    return (0.65 * $CurrentSmoothedSpeed) + (0.35 * $InstantSpeed)
+}
+
+function Receive-FileWithProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Activity
+    )
+    $destinationDir = Split-Path -Parent $Destination
+    if (-not [string]::IsNullOrWhiteSpace($destinationDir) -and -not (Test-Path -LiteralPath $destinationDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }
+
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.UserAgent = 'Android-SDK-Installer'
+    $request.AllowAutoRedirect = $true
+    $request.Timeout = 60000
+    $request.ReadWriteTimeout = 300000
+    try { $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate } catch { }
+
+    $response = $request.GetResponse()
+    try {
+        $totalBytes = [double]$response.ContentLength
+        if ($totalBytes -lt 0) { $totalBytes = 0 }
+        $finalUri = [string]$response.ResponseUri
+        $source = $response.GetResponseStream()
+        try {
+            $output = [IO.File]::Create($Destination)
+            try {
+                $buffer = New-Object 'byte[]' 131072
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                $received = [double]0
+                $speed = [double]0
+                $lastRender = [double]-1
+                $lastSampleAt = [double]0
+                $lastSampleBytes = [double]0
+                Show-TransferProgress -Activity $Activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1
+                while ($true) {
+                    $read = $source.Read($buffer, 0, $buffer.Length)
+                    if ($read -le 0) { break }
+                    $output.Write($buffer, 0, $read)
+                    $received += [double]$read
+                    $elapsed = $clock.Elapsed.TotalSeconds
+                    if (($elapsed - $lastSampleAt) -ge 0.5) {
+                        $window = $elapsed - $lastSampleAt
+                        if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($received - $lastSampleBytes) / $window) }
+                        $lastSampleAt = $elapsed
+                        $lastSampleBytes = $received
+                    }
+                    $finished = ($totalBytes -gt 0) -and ($received -ge $totalBytes)
+                    if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+                        $lastRender = $elapsed
+                        $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $received) / $speed } else { -1 }
+                        Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Completed:$finished
+                    }
+                }
+                $output.Flush($true)
+                $clock.Stop()
+                $seconds = $clock.Elapsed.TotalSeconds
+                Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Completed
+                $average = if ($seconds -gt 0) { $received / $seconds } else { 0 }
+                return [pscustomobject]@{ Bytes = $received; Seconds = $seconds; AverageSpeed = $average; Source = $finalUri }
+            } finally { $output.Dispose() }
+        } finally { $source.Dispose() }
+    } finally { $response.Close() }
+}
+
+function Receive-FileSimple {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
     $client = New-Object Net.WebClient
     try {
         $client.Headers.Add('User-Agent', 'Android-SDK-Installer')
         $client.DownloadFile($Url, $Destination)
     } finally { $client.Dispose() }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw "The download did not create an output file: $Url" }
+    return [pscustomobject]@{ Bytes = [double](Get-Item -LiteralPath $Destination).Length; Seconds = 0; AverageSpeed = 0; Source = $Url }
+}
+
+function Download-File {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Url,
+        [Parameter(Mandatory = $true, Position = 1)][string]$Destination,
+        [Parameter(Position = 2)][string]$Label
+    )
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    if ([string]::IsNullOrWhiteSpace($Label)) {
+        $Label = ''
+        try { $Label = [IO.Path]::GetFileName(([Uri]$Url).AbsolutePath) } catch { $Label = '' }
+        if ([string]::IsNullOrWhiteSpace($Label)) { $Label = [IO.Path]::GetFileName($Destination) }
+    }
+    $activity = "Downloading $Label"
+    $result = $null
+    try {
+        $result = Receive-FileWithProgress -Url $Url -Destination $Destination -Activity $activity
+    } catch {
+        $failure = $_.Exception.Message
+        Reset-TransferProgress -Activity $activity
+        $partial = [double]0
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) { try { $partial = (Get-Item -LiteralPath $Destination).Length } catch { $partial = 0 } }
+        if ($partial -gt 0) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw "The download stopped after $(Format-ByteSize $partial) of $Label. $failure"
+        }
+        Write-Host "[!] The live progress bar could not start for $Label ($failure). Retrying with a plain download..." -ForegroundColor Yellow
+        try { $result = Receive-FileSimple -Url $Url -Destination $Destination }
+        catch { throw "The download failed for ${Label}: $($_.Exception.Message)" }
+    }
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw 'The download did not create an output file.' }
+    if ($result.Seconds -gt 0) {
+        $summary = ('{0} ({1}) downloaded in {2}, average {3}/s' -f $Label, (Format-ByteSize $result.Bytes), (Format-DurationClock $result.Seconds), (Format-ByteSize $result.AverageSpeed))
+    } else {
+        $summary = ('{0} ({1}) downloaded.' -f $Label, (Format-ByteSize $result.Bytes))
+    }
+    Complete-TransferProgress -Activity $activity -Summary $summary
+}
+
+function Expand-ZipWithProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [Parameter(Mandatory = $true)][string]$Activity
+    )
+    try { Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue } catch { }
+    try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch { }
+    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) { throw "The archive was not found: $LiteralPath" }
+    if (-not (Test-Path -LiteralPath $DestinationPath -PathType Container)) { New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null }
+    $destinationRoot = (Resolve-Path -LiteralPath $DestinationPath).ProviderPath.TrimEnd('\') + '\'
+
+    $archive = [IO.Compression.ZipFile]::OpenRead($LiteralPath)
+    try {
+        $entries = @($archive.Entries)
+        $totalEntries = $entries.Count
+        if ($totalEntries -eq 0) { return }
+        $totalBytes = [double]($entries | Measure-Object -Property Length -Sum).Sum
+        $createdDirectories = @{}
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $doneBytes = [double]0
+        $doneEntries = 0
+        $speed = [double]0
+        $lastRender = [double]-1
+        $lastSampleAt = [double]0
+        $lastSampleBytes = [double]0
+        Show-TransferProgress -Activity $Activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,6}/{1,5} files' -f 0, $totalEntries)
+        foreach ($entry in $entries) {
+            $relative = $entry.FullName.Replace('\', '/').TrimStart('/')
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+            $target = [IO.Path]::GetFullPath((Join-Path $destinationRoot ($relative -replace '/', '\')))
+            if (-not $target.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                Write-Warning "Skipped an unsafe archive entry: $($entry.FullName)"
+                continue
+            }
+            if ($relative.EndsWith('/')) {
+                [void][IO.Directory]::CreateDirectory($target)
+            } else {
+                $targetDirectory = Split-Path -Parent $target
+                if (-not $createdDirectories.ContainsKey($targetDirectory)) {
+                    [void][IO.Directory]::CreateDirectory($targetDirectory)
+                    $createdDirectories[$targetDirectory] = $true
+                }
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                $doneBytes += [double]$entry.Length
+            }
+            $doneEntries++
+            $elapsed = $clock.Elapsed.TotalSeconds
+            if (($elapsed - $lastSampleAt) -ge 0.5) {
+                $window = $elapsed - $lastSampleAt
+                if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
+                $lastSampleAt = $elapsed
+                $lastSampleBytes = $doneBytes
+            }
+            $finished = $doneEntries -ge $totalEntries
+            if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+                $lastRender = $elapsed
+                $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
+                Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries) -Completed:$finished
+            }
+        }
+        $clock.Stop()
+        $seconds = $clock.Elapsed.TotalSeconds
+        Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries) -Completed
+        Complete-TransferProgress -Activity $Activity -Summary ("{0} extracted: {1} in {2}" -f $doneEntries, (Format-ByteSize $doneBytes), (Format-DurationClock $seconds))
+    } finally { $archive.Dispose() }
+}
+
+function Expand-ArchiveWithProgress {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$LiteralPath,
+        [Parameter(Mandatory = $true, Position = 1)][string]$DestinationPath,
+        [Parameter(Position = 2)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($Label)) { $Label = [IO.Path]::GetFileName($LiteralPath) }
+    $activity = "Extracting $Label"
+    try {
+        Expand-ZipWithProgress -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Activity $activity
+    } catch {
+        Reset-TransferProgress -Activity $activity
+        Write-Warning "Progress-based extraction failed ($($_.Exception.Message)); falling back to Expand-Archive."
+        if (Test-Path -LiteralPath $DestinationPath -PathType Container) { Remove-Item -LiteralPath $DestinationPath -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+        Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force
+        Write-Host '    [+] Extraction finished.' -ForegroundColor Green
+    }
+}
+
+function Copy-TreeWithProgress {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Source,
+        [Parameter(Mandatory = $true, Position = 1)][string]$Destination,
+        [Parameter(Position = 2)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($Label)) { $Label = 'files' }
+    $activity = "Copying $Label"
+    $items = @(Get-ChildItem -LiteralPath $Source -Force)
+    if ($items.Count -eq 0) { return }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Container)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+
+    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
+        foreach ($item in $items) { Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force }
+        return
+    }
+
+    # Measure first so the percentage, speed, and time-left numbers stay accurate.
+    $itemSizes = @{}
+    $totalBytes = [double]0
+    foreach ($item in $items) {
+        if ($item.PSIsContainer) {
+            $size = [double](@(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum)
+        } else { $size = [double]$item.Length }
+        $itemSizes[$item.FullName] = $size
+        $totalBytes += $size
+    }
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $doneBytes = [double]0
+    $speed = [double]0
+    $lastRender = [double]-1
+    $lastSampleAt = [double]0
+    $lastSampleBytes = [double]0
+    $index = 0
+    Show-TransferProgress -Activity $activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,4}/{1,4} items' -f 0, $items.Count)
+    foreach ($item in $items) {
+        $index++
+        Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
+        $doneBytes += [double]$itemSizes[$item.FullName]
+        $elapsed = $clock.Elapsed.TotalSeconds
+        if (($elapsed - $lastSampleAt) -ge 0.5) {
+            $window = $elapsed - $lastSampleAt
+            if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
+            $lastSampleAt = $elapsed
+            $lastSampleBytes = $doneBytes
+        }
+        $finished = $index -ge $items.Count
+        if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+            $lastRender = $elapsed
+            $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
+            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,4}/{1,4} items' -f $index, $items.Count) -Completed:$finished
+        }
+    }
+    $clock.Stop()
+    Complete-TransferProgress -Activity $activity -Summary ("{0} copied: {1} in {2}" -f $items.Count, (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
+}
+
+function Copy-FileWithProgress {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Source,
+        [Parameter(Mandatory = $true, Position = 1)][string]$Destination,
+        [Parameter(Position = 2)][string]$Label
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "The source file was not found: $Source" }
+    if ([string]::IsNullOrWhiteSpace($Label)) { $Label = [IO.Path]::GetFileName($Source) }
+    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        return
+    }
+    $activity = "Copying $Label"
+    $totalBytes = [double](Get-Item -LiteralPath $Source).Length
+    $destinationDir = Split-Path -Parent $Destination
+    if (-not [string]::IsNullOrWhiteSpace($destinationDir) -and -not (Test-Path -LiteralPath $destinationDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+    $sourceStream = [IO.File]::OpenRead($Source)
+    try {
+        $output = [IO.File]::Create($Destination)
+        try {
+            $buffer = New-Object 'byte[]' 262144
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $doneBytes = [double]0
+            $speed = [double]0
+            $lastRender = [double]-1
+            $lastSampleAt = [double]0
+            $lastSampleBytes = [double]0
+            Show-TransferProgress -Activity $activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1
+            while ($true) {
+                $read = $sourceStream.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $output.Write($buffer, 0, $read)
+                $doneBytes += [double]$read
+                $elapsed = $clock.Elapsed.TotalSeconds
+                if (($elapsed - $lastSampleAt) -ge 0.5) {
+                    $window = $elapsed - $lastSampleAt
+                    if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
+                    $lastSampleAt = $elapsed
+                    $lastSampleBytes = $doneBytes
+                }
+                $finished = ($totalBytes -gt 0) -and ($doneBytes -ge $totalBytes)
+                if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+                    $lastRender = $elapsed
+                    $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
+                    Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Completed:$finished
+                }
+            }
+            $output.Flush($true)
+            $clock.Stop()
+            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $clock.Elapsed.TotalSeconds -RemainingSeconds 0 -Completed
+            Complete-TransferProgress -Activity $activity -Summary ("{0} copied in {1}" -f (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
+        } finally { $output.Dispose() }
+    } finally { $sourceStream.Dispose() }
 }
 
 function Find-ExtractedAndroidTools {
@@ -643,16 +1118,17 @@ function Install-AndroidSdk {
     try {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         Write-Host '[*] Downloading Android command-line tools...' -ForegroundColor Yellow
-        Download-File $toolsUrl $zip
+        Download-File $toolsUrl $zip 'Android command-line tools'
         if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The command-line tools download is too small to be a valid archive.' }
         New-Item -ItemType Directory -Path $extract -Force | Out-Null
         Write-Host '[*] Extracting Android command-line tools...' -ForegroundColor Yellow
-        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+        Expand-ArchiveWithProgress -LiteralPath $zip -DestinationPath $extract -Label 'Android command-line tools'
         $toolsSource = Find-ExtractedAndroidTools $extract
         if (-not $toolsSource) { throw 'The downloaded ZIP does not contain a cmdline-tools folder with sdkmanager.bat or android.exe.' }
 
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
-        Get-ChildItem -LiteralPath $toolsSource -Force | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force }
+        Write-Host '[*] Staging the extracted command-line tools...' -ForegroundColor Yellow
+        Copy-TreeWithProgress -Source $toolsSource -Destination $stage -Label 'Android command-line tools'
         if (-not (Test-CmdlineToolsDirectory $stage)) { throw 'The downloaded folder does not contain usable Android command-line tools.' }
 
         $toolsRoot = Join-Path $script:SdkRoot 'cmdline-tools'
@@ -757,17 +1233,17 @@ function Install-Flutter {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         if ($source.Kind -eq 'Url') {
             Write-Host '[*] Downloading Flutter to a temporary folder...' -ForegroundColor Yellow
-            Download-File $source.Path $zip
+            Download-File $source.Path $zip 'Flutter SDK'
         } elseif ($source.Kind -eq 'Zip') {
             Write-Host '[*] Copying the ZIP to a temporary folder. The source file will not be deleted.' -ForegroundColor Yellow
-            Copy-Item -LiteralPath $source.Path -Destination $zip -Force
+            Copy-FileWithProgress -Source $source.Path -Destination $zip -Label $source.Name
         } else { $flutterSource = $source.Path }
 
         if ($source.Kind -ne 'Folder') {
             if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The selected file is too small to be a Flutter SDK ZIP.' }
             New-Item -ItemType Directory -Path $extract -Force | Out-Null
-            Write-Host '[*] Extracting Flutter. This may take several minutes...' -ForegroundColor Yellow
-            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+            Write-Host '[*] Extracting Flutter. The progress bar shows the size, speed, and time left...' -ForegroundColor Yellow
+            Expand-ArchiveWithProgress -LiteralPath $zip -DestinationPath $extract -Label 'Flutter SDK'
             $folders = @(Get-FlutterFolders $extract)
             if ($folders.Count -eq 0) { throw 'The ZIP does not contain a Flutter SDK with bin\flutter.bat.' }
             $flutterSource = $folders[0]
@@ -776,7 +1252,8 @@ function Install-Flutter {
 
         if ($source.Kind -eq 'Folder') {
             New-Item -ItemType Directory -Path $stage -Force | Out-Null
-            Get-ChildItem -LiteralPath $flutterSource -Force | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force }
+            Write-Host '[*] Staging the selected Flutter folder...' -ForegroundColor Yellow
+            Copy-TreeWithProgress -Source $flutterSource -Destination $stage -Label 'Flutter SDK'
         } else { Move-Item -LiteralPath $flutterSource -Destination $stage }
         if (-not (Test-Path -LiteralPath (Join-Path $stage 'bin\flutter.bat') -PathType Leaf)) { throw 'Flutter staging verification failed.' }
 
@@ -1041,9 +1518,9 @@ while ($true) {
     Write-Host ''
     $choice = (Read-Host 'Enter your choice (1, 2, 3, or 0)').Trim()
     switch ($choice) {
-        '1' { try { Install-AndroidSdk } catch { Write-Host "`nANDROID SDK INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
-        '2' { try { Install-Flutter } catch { Write-Host "`nFLUTTER INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
-        '3' { try { Show-EnvironmentPathStatus } catch { Write-Host "`nENVIRONMENT PATH CHECK FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
+        '1' { try { Install-AndroidSdk } catch { Close-InlineProgressLine; Write-Host "`nANDROID SDK INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
+        '2' { try { Install-Flutter } catch { Close-InlineProgressLine; Write-Host "`nFLUTTER INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
+        '3' { try { Show-EnvironmentPathStatus } catch { Close-InlineProgressLine; Write-Host "`nENVIRONMENT PATH CHECK FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
         '0' { exit 0 }
         default { Write-Host 'Invalid choice. Enter 1, 2, 3, or 0.' -ForegroundColor Red; Start-Sleep -Seconds 1 }
     }
