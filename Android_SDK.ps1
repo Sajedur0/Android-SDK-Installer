@@ -137,9 +137,64 @@ function Grant-OriginalUserModifyAccess {
     if ($code -ne 0) { Write-Warning "Could not grant modify access to the signed-in user for $Path (icacls exit code $code)." }
 }
 
+function Get-OriginalUserProfilePath {
+    if ([string]::IsNullOrWhiteSpace($script:OriginalUserSid)) { return $null }
+    $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($script:OriginalUserSid)"
+    try {
+        $path = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).ProfileImagePath
+        if (-not [string]::IsNullOrWhiteSpace($path)) { return [Environment]::ExpandEnvironmentVariables($path) }
+    } catch { }
+    return $null
+}
+
+function Get-NativeWindowsArch {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
+    if ($arch -eq 'ARM64') { return 'arm64' }
+    return 'x64'
+}
+
+function Test-UsableExecutable {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        # App execution aliases under WindowsApps are 0-byte stubs and fail when elevated.
+        return ($item.Length -gt 0)
+    } catch { return $false }
+}
+
 function Get-WingetPath {
     $cmd = Get-Command 'winget.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) { return $cmd.Source }
+    if ($cmd -and (Test-UsableExecutable $cmd.Source)) { return $cmd.Source }
+
+    $candidates = @()
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe') }
+    $profile = Get-OriginalUserProfilePath
+    if ($profile) { $candidates += (Join-Path $profile 'AppData\Local\Microsoft\WindowsApps\winget.exe') }
+    foreach ($path in $candidates) {
+        if (Test-UsableExecutable $path) { return $path }
+    }
+
+    try {
+        $packages = @(Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue)
+        if ($packages.Count -eq 0) {
+            $packages = @(Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue)
+        }
+        foreach ($pkg in $packages) {
+            if ([string]::IsNullOrWhiteSpace($pkg.InstallLocation)) { continue }
+            $exe = Join-Path $pkg.InstallLocation 'winget.exe'
+            if (Test-UsableExecutable $exe) { return $exe }
+        }
+    } catch { }
+
+    $windowsApps = Join-Path $env:ProgramFiles 'WindowsApps'
+    if (Test-Path -LiteralPath $windowsApps -PathType Container) {
+        foreach ($folder in (Get-ChildItem -LiteralPath $windowsApps -Directory -Filter 'Microsoft.DesktopAppInstaller_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+            $exe = Join-Path $folder.FullName 'winget.exe'
+            if (Test-UsableExecutable $exe) { return $exe }
+        }
+    }
     return $null
 }
 
@@ -151,6 +206,89 @@ function Install-WingetPackage {
     $code = Invoke-ExternalToHost -Path $winget -ArgumentList @('install', '--id', $PackageId, '--exact', '--scope', 'machine', '--accept-source-agreements')
     if ($code -ne 0) { throw "winget could not install $DisplayName (exit code $code)." }
     Refresh-ProcessPath
+}
+
+function Find-ExtractedJdkHome {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $null }
+    $roots = @($Root)
+    foreach ($dir in (Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)) { $roots += $dir.FullName }
+    foreach ($home in $roots) {
+        $java = Join-Path $home 'bin\java.exe'
+        $javac = Join-Path $home 'bin\javac.exe'
+        if ((Test-Path -LiteralPath $java -PathType Leaf) -and (Test-Path -LiteralPath $javac -PathType Leaf)) { return $home }
+    }
+    return $null
+}
+
+function Install-TemurinJdkFromAdoptium {
+    $arch = Get-NativeWindowsArch
+    $adoptiumArch = if ($arch -eq 'arm64') { 'aarch64' } else { 'x64' }
+    $url = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/$adoptiumArch/jdk/hotspot/normal/eclipse?project=jdk"
+    $work = Join-Path $env:TEMP ('TemurinJdk-' + [guid]::NewGuid().ToString('N'))
+    $zip = Join-Path $work 'temurin-jdk-17.zip'
+    $extract = Join-Path $work 'extract'
+    try {
+        New-Item -ItemType Directory -Path $work -Force | Out-Null
+        Write-Host "[*] Downloading Eclipse Temurin JDK 17 ($adoptiumArch) from Adoptium..." -ForegroundColor Yellow
+        Download-File $url $zip
+        if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The Temurin JDK download is too small to be a valid archive.' }
+        New-Item -ItemType Directory -Path $extract -Force | Out-Null
+        Write-Host '[*] Extracting Eclipse Temurin JDK 17...' -ForegroundColor Yellow
+        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+        $jdkFolder = Find-ExtractedJdkHome $extract
+        if (-not $jdkFolder) { throw 'The Temurin archive did not contain a JDK with java.exe and javac.exe.' }
+
+        $vendorRoot = Join-Path $env:ProgramFiles 'Eclipse Adoptium'
+        New-Item -ItemType Directory -Path $vendorRoot -Force | Out-Null
+        $destName = Split-Path -Leaf $jdkFolder
+        if ([string]::IsNullOrWhiteSpace($destName) -or ($destName -ieq 'extract')) { $destName = 'jdk-17-hotspot' }
+        $dest = Join-Path $vendorRoot $destName
+        if (Test-Path -LiteralPath $dest) { $dest = Join-Path $vendorRoot ($destName + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+        Write-Host "[*] Installing JDK to $dest" -ForegroundColor Yellow
+        Move-Item -LiteralPath $jdkFolder -Destination $dest
+        if (-not (Test-Path -LiteralPath (Join-Path $dest 'bin\javac.exe') -PathType Leaf)) { throw "JDK files were not found after extracting to $dest." }
+        Refresh-ProcessPath
+    } finally {
+        if (Test-Path -LiteralPath $work -PathType Container) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Install-GitFromGitHub {
+    $arch = Get-NativeWindowsArch
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Write-Host '[*] Looking up the latest Git for Windows release...' -ForegroundColor Yellow
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{ 'User-Agent' = 'Android-SDK-Installer' }
+    $asset = $null
+    foreach ($item in @($release.assets)) {
+        $name = [string]$item.name
+        if ($arch -eq 'arm64') {
+            if ($name -match '(?i)^Git-.+-arm64\.exe$') { $asset = $item; break }
+        } elseif ($name -match '(?i)^Git-.+-64-bit\.exe$' -and $name -notmatch '(?i)(busybox|mingit|portable)') {
+            $asset = $item
+            break
+        }
+    }
+    if (-not $asset) { throw 'Could not find a Git for Windows installer in the latest GitHub release.' }
+
+    $work = Join-Path $env:TEMP ('GitInstaller-' + [guid]::NewGuid().ToString('N'))
+    $setup = Join-Path $work $asset.name
+    try {
+        New-Item -ItemType Directory -Path $work -Force | Out-Null
+        Write-Host "[*] Downloading $($asset.name)..." -ForegroundColor Yellow
+        Download-File $asset.browser_download_url $setup
+        if ((Get-Item -LiteralPath $setup).Length -lt 1048576) { throw 'The Git installer download is too small to be valid.' }
+        Write-Host '[*] Installing Git for Windows...' -ForegroundColor Yellow
+        $setupArgs = '/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /COMPONENTS=gitlfs,assoc,assoc_sh /o:PathOption=Cmd'
+        $process = Start-Process -FilePath $setup -ArgumentList $setupArgs -Wait -PassThru
+        if ($null -eq $process -or ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010)) {
+            $code = if ($null -eq $process) { 'unknown' } else { $process.ExitCode }
+            throw "Git installer failed (exit code $code)."
+        }
+        Refresh-ProcessPath
+    } finally {
+        if (Test-Path -LiteralPath $work -PathType Container) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Get-JdkInfo {
@@ -198,9 +336,22 @@ function Ensure-Jdk {
     $jdk = Get-JdkInfo
     if (-not $jdk.Ready) {
         Write-Host 'A JDK 17 or newer is required for Android builds.' -ForegroundColor Yellow
-        $answer = Read-Host 'Install Eclipse Temurin JDK 17 with winget now? (Y/N)'
+        $answer = Read-Host 'Install Eclipse Temurin JDK 17 now? (Y/N)'
         if ($answer -notmatch '(?i)^y(es)?$') { throw 'Install a JDK 17+ and run this installer again.' }
-        Install-WingetPackage 'EclipseAdoptium.Temurin.17.JDK' 'Eclipse Temurin JDK 17'
+        $installed = $false
+        if (Get-WingetPath) {
+            try {
+                Install-WingetPackage 'EclipseAdoptium.Temurin.17.JDK' 'Eclipse Temurin JDK 17'
+                $installed = $true
+            } catch {
+                Write-Warning $_.Exception.Message
+                Write-Host '[*] Falling back to a direct Adoptium download...' -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host '[*] winget was not found. Downloading Eclipse Temurin JDK 17 from Adoptium...' -ForegroundColor Yellow
+        }
+        if (-not $installed) { Install-TemurinJdkFromAdoptium }
+        Refresh-ProcessPath
         $jdk = Get-JdkInfo
         if (-not $jdk.Ready) { throw 'JDK installation finished, but java.exe and javac.exe for JDK 17+ were not found. Reopen the terminal and retry.' }
     }
@@ -223,9 +374,22 @@ function Ensure-GitForWindows {
     $git = Get-GitPath
     if (-not $git) {
         Write-Host 'Git for Windows is required by Flutter.' -ForegroundColor Yellow
-        $answer = Read-Host 'Install Git for Windows with winget now? (Y/N)'
+        $answer = Read-Host 'Install Git for Windows now? (Y/N)'
         if ($answer -notmatch '(?i)^y(es)?$') { throw 'Install Git for Windows and run the Flutter installer again.' }
-        Install-WingetPackage 'Git.Git' 'Git for Windows'
+        $installed = $false
+        if (Get-WingetPath) {
+            try {
+                Install-WingetPackage 'Git.Git' 'Git for Windows'
+                $installed = $true
+            } catch {
+                Write-Warning $_.Exception.Message
+                Write-Host '[*] Falling back to a direct Git for Windows download...' -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host '[*] winget was not found. Downloading Git for Windows from GitHub...' -ForegroundColor Yellow
+        }
+        if (-not $installed) { Install-GitFromGitHub }
+        Refresh-ProcessPath
         $git = Get-GitPath
         if (-not $git) { throw 'Git installation finished, but git.exe was not found. Reopen the terminal and retry.' }
     }
@@ -409,7 +573,10 @@ function Download-File {
     param([string]$Url, [string]$Destination)
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $client = New-Object Net.WebClient
-    try { $client.DownloadFile($Url, $Destination) } finally { $client.Dispose() }
+    try {
+        $client.Headers.Add('User-Agent', 'Android-SDK-Installer')
+        $client.DownloadFile($Url, $Destination)
+    } finally { $client.Dispose() }
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw 'The download did not create an output file.' }
 }
 
