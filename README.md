@@ -38,6 +38,21 @@ The bar reports:
 
 The same bar covers the JDK download, the Git for Windows download, the Android command-line tools download, the Flutter download, every ZIP extraction, and the local copies into `C:\Android` and `C:\flutter`. It adapts to the console width, and when the server does not send a size it keeps showing the downloaded amount and speed with a moving marker instead of a percentage. In hosts without a real console line (PowerShell ISE, redirected logs, remoting) the same numbers are reported through the native `Write-Progress` bar. Set `ANDROID_SDK_INSTALLER_NO_PROGRESS=1` to turn the bars off.
 
+### Testing the progress bar
+
+`tests/Progress.Tests.ps1` loads only the progress helpers out of `Android_SDK.ps1` and checks them, so it is safe to run on any Windows machine and never installs anything. It verifies the size and time formatting, that the rendered bar never exceeds the console width from 40 to 200 columns, that ZIP extraction and folder copies keep every file byte-for-byte, that an entry pointing outside the destination folder is skipped, and that a failed download leaves no partial file.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Progress.Tests.ps1   # Windows PowerShell 5.1
+pwsh -NoProfile -File tests/Progress.Tests.ps1                                  # PowerShell 7
+```
+
+To watch the bar animate without downloading anything, run the demo. It drives the same rendering code with simulated transfers (a JDK download, the command-line tools, a Flutter extraction with a file counter, and a server that reports no size). Set `ANDROID_SDK_INSTALLER_DEMO_CONSOLE_WIDTH` to preview a narrower or wider console.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Progress.Demo.ps1
+```
+
 ### Environment path check
 
 Choose **3. Check Environment Paths** to check the Machine, User, and current Process scopes. The read-only check reports `JAVA_HOME` and JDK executables, Python executables or the `py` launcher, Android SDK variables and tools, `FLUTTER_ROOT`, and whether their expected directories are in `PATH`. Python is checked only; this installer does not install it. Open a new terminal after a Machine or User PATH change.
@@ -106,7 +121,7 @@ For the SDK package list, use `android sdk list` if the Android CLI is installed
 | `Android_SDK.ps1` | Main installer and menu |
 | `Run.bat` | Launcher; PowerShell handles UAC elevation |
 | `tests/Progress.Tests.ps1` | Progress-bar, extraction, and copy tests for Windows PowerShell 5.1 and PowerShell 7 |
-| `.github/workflows/validate.yml` | Runs those tests on a Windows runner for every push and pull request |
+| `tests/Progress.Demo.ps1` | Animates the real progress bar with simulated transfers; downloads nothing |
 | `.gitattributes` | Keeps Windows batch files on CRLF line endings |
 | `README.md` | This guide |
 

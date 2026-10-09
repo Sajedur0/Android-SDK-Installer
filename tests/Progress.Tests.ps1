@@ -40,7 +40,7 @@ if (@($parseErrors).Count -gt 0) { $parseErrors | ForEach-Object { Write-Host " 
 $wanted = @(
     'Test-InlineProgressSupported', 'Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock',
     'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
-    'Get-SmoothedSpeed', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
+    'Get-SmoothedSpeed', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
     'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress'
 )
 $definitions = $ast.FindAll({
@@ -194,6 +194,27 @@ foreach ($relative in $expected) {
     $right = (Get-FileHash -LiteralPath (Join-Path $treeTarget $relative) -Algorithm SHA256).Hash
     Assert-Equal $left $right "Content of $relative survives the folder copy"
 }
+
+# Attributes and empty folders must survive the folder copy too.
+$attributed = Join-Path $work 'attributed'
+New-Item -ItemType Directory -Path (Join-Path $attributed 'sub\empty-dir') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $attributed 'plain.txt') -Value 'plain content' -Encoding UTF8
+$flagged = Join-Path $attributed 'sub\flagged.txt'
+Set-Content -LiteralPath $flagged -Value 'flagged content' -Encoding UTF8
+Set-ItemProperty -LiteralPath $flagged -Name Attributes -Value ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::ReadOnly)
+$attributedTarget = Join-Path $work 'attributed-copy'
+New-Item -ItemType Directory -Path $attributedTarget -Force | Out-Null
+Copy-TreeWithProgress -Source $attributed -Destination $attributedTarget -Label 'attributed tree'
+Assert-True (Test-Path -LiteralPath (Join-Path $attributedTarget 'plain.txt')) 'Folder copy keeps top-level files'
+Assert-True (Test-Path -LiteralPath (Join-Path $attributedTarget 'sub\empty-dir') -PathType Container) 'Folder copy keeps empty folders'
+$flaggedCopy = Join-Path $attributedTarget 'sub\flagged.txt'
+Assert-True (Test-Path -LiteralPath $flaggedCopy) 'Folder copy keeps hidden files'
+Assert-Equal (Get-FileHash -LiteralPath $flagged -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $flaggedCopy -Algorithm SHA256).Hash 'Hidden file content survives the copy'
+$copyAttributes = (Get-Item -LiteralPath $flaggedCopy -Force).Attributes
+Assert-True (($copyAttributes -band [IO.FileAttributes]::Hidden) -eq [IO.FileAttributes]::Hidden) 'Hidden attribute is preserved'
+Assert-True (($copyAttributes -band [IO.FileAttributes]::ReadOnly) -eq [IO.FileAttributes]::ReadOnly) 'ReadOnly attribute is preserved'
+Set-ItemProperty -LiteralPath $flaggedCopy -Name Attributes -Value ([IO.FileAttributes]::Normal)
+Set-ItemProperty -LiteralPath $flagged -Name Attributes -Value ([IO.FileAttributes]::Normal)
 
 $fileTarget = Join-Path $work 'single-copy.bin'
 Copy-FileWithProgress -Source (Join-Path $payload 'nested\deeper\two.bin') -Destination $fileTarget -Label 'two.bin'

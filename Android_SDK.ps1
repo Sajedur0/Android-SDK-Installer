@@ -653,7 +653,7 @@ function Show-TransferProgress {
         # Size unknown: slide a marker so the bar still shows movement and speed.
         $marker = [Math]::Min(3, $barWidth)
         $span = [Math]::Max(1, $barWidth - $marker)
-        $position = [int][Math]::Floor($ElapsedSeconds * 4) % $span
+        $position = ([int][Math]::Floor($ElapsedSeconds * 4)) % $span
         Write-Host ('-' * $position) -NoNewline -ForegroundColor DarkGray
         Write-Host ('#' * $marker) -NoNewline -ForegroundColor Yellow
         Write-Host ('-' * [Math]::Max(0, $barWidth - $position - $marker)) -NoNewline -ForegroundColor DarkGray
@@ -707,18 +707,18 @@ function Receive-FileWithProgress {
     $request.AllowAutoRedirect = $true
     $request.Timeout = 60000
     $request.ReadWriteTimeout = 300000
-    try { $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate } catch { }
 
     $response = $request.GetResponse()
     try {
         $totalBytes = [double]$response.ContentLength
         if ($totalBytes -lt 0) { $totalBytes = 0 }
-        $finalUri = [string]$response.ResponseUri
+        $finalUri = $Url
+        try { if ($null -ne $response.ResponseUri) { $finalUri = [string]$response.ResponseUri } } catch { }
         $source = $response.GetResponseStream()
         try {
             $output = [IO.File]::Create($Destination)
             try {
-                $buffer = New-Object 'byte[]' 131072
+                $buffer = New-Object 'byte[]' 524288
                 $clock = [Diagnostics.Stopwatch]::StartNew()
                 $received = [double]0
                 $speed = [double]0
@@ -793,7 +793,14 @@ function Download-File {
         if (Test-Path -LiteralPath $Destination -PathType Leaf) { try { $partial = (Get-Item -LiteralPath $Destination).Length } catch { $partial = 0 } }
         if ($partial -gt 0) {
             Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            throw "The download stopped after $(Format-ByteSize $partial) of $Label. $failure"
+            throw "The download of $Label stopped after $(Format-ByteSize $partial). $failure"
+        }
+        $serverResponse = $null
+        if ($_.Exception -is [Net.WebException]) { $serverResponse = $_.Exception.Response }
+        if ($null -ne $serverResponse) {
+            $status = ''
+            try { $status = "$([int]$serverResponse.StatusCode) $($serverResponse.StatusCode)" } catch { $status = $failure }
+            throw "The server rejected the download of ${Label}: $status"
         }
         Write-Host "[!] The live progress bar could not start for $Label ($failure). Retrying with a plain download..." -ForegroundColor Yellow
         try { $result = Receive-FileSimple -Url $Url -Destination $Destination }
@@ -896,6 +903,18 @@ function Expand-ArchiveWithProgress {
     }
 }
 
+function Copy-SingleFile {
+    param(
+        [Parameter(Mandatory = $true)][IO.FileInfo]$File,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+    [IO.File]::Copy($File.FullName, $Target, $true)
+    $attributes = $File.Attributes
+    if ((($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($attributes -ne [IO.FileAttributes]::Normal)) {
+        try { [IO.File]::SetAttributes($Target, $attributes) } catch { }
+    }
+}
+
 function Copy-TreeWithProgress {
     param(
         [Parameter(Mandatory = $true, Position = 0)][string]$Source,
@@ -903,25 +922,25 @@ function Copy-TreeWithProgress {
         [Parameter(Position = 2)][string]$Label
     )
     if ([string]::IsNullOrWhiteSpace($Label)) { $Label = 'files' }
-    $activity = "Copying $Label"
-    $items = @(Get-ChildItem -LiteralPath $Source -Force)
-    if ($items.Count -eq 0) { return }
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { throw "The source folder was not found: $Source" }
     if (-not (Test-Path -LiteralPath $Destination -PathType Container)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+    $sourceRoot = (Resolve-Path -LiteralPath $Source).ProviderPath.TrimEnd('\')
+    $destinationRoot = (Resolve-Path -LiteralPath $Destination).ProviderPath.TrimEnd('\')
 
-    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
-        foreach ($item in $items) { Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force }
-        return
+    # One enumeration feeds the folder structure, the byte total, and the per-file copy loop.
+    $entries = @(Get-ChildItem -LiteralPath $Source -Recurse -Force -ErrorAction SilentlyContinue)
+    $directories = @($entries | Where-Object { $_.PSIsContainer })
+    $files = @($entries | Where-Object { -not $_.PSIsContainer })
+    foreach ($directory in $directories) {
+        [void][IO.Directory]::CreateDirectory($destinationRoot + $directory.FullName.Substring($sourceRoot.Length))
     }
+    if ($files.Count -eq 0) { return }
+    $totalBytes = [double]($files | Measure-Object -Property Length -Sum).Sum
 
-    # Measure first so the percentage, speed, and time-left numbers stay accurate.
-    $itemSizes = @{}
-    $totalBytes = [double]0
-    foreach ($item in $items) {
-        if ($item.PSIsContainer) {
-            $size = [double](@(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum)
-        } else { $size = [double]$item.Length }
-        $itemSizes[$item.FullName] = $size
-        $totalBytes += $size
+    $activity = "Copying $Label"
+    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
+        foreach ($file in $files) { Copy-SingleFile -File $file -Target ($destinationRoot + $file.FullName.Substring($sourceRoot.Length)) }
+        return
     }
 
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -931,11 +950,11 @@ function Copy-TreeWithProgress {
     $lastSampleAt = [double]0
     $lastSampleBytes = [double]0
     $index = 0
-    Show-TransferProgress -Activity $activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,4}/{1,4} items' -f 0, $items.Count)
-    foreach ($item in $items) {
+    Show-TransferProgress -Activity $activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,6}/{1,5} files' -f 0, $files.Count)
+    foreach ($file in $files) {
+        Copy-SingleFile -File $file -Target ($destinationRoot + $file.FullName.Substring($sourceRoot.Length))
+        $doneBytes += [double]$file.Length
         $index++
-        Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
-        $doneBytes += [double]$itemSizes[$item.FullName]
         $elapsed = $clock.Elapsed.TotalSeconds
         if (($elapsed - $lastSampleAt) -ge 0.5) {
             $window = $elapsed - $lastSampleAt
@@ -943,15 +962,15 @@ function Copy-TreeWithProgress {
             $lastSampleAt = $elapsed
             $lastSampleBytes = $doneBytes
         }
-        $finished = $index -ge $items.Count
+        $finished = $index -ge $files.Count
         if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
             $lastRender = $elapsed
             $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
-            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,4}/{1,4} items' -f $index, $items.Count) -Completed:$finished
+            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $index, $files.Count) -Completed:$finished
         }
     }
     $clock.Stop()
-    Complete-TransferProgress -Activity $activity -Summary ("{0} copied: {1} in {2}" -f $items.Count, (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
+    Complete-TransferProgress -Activity $activity -Summary ("{0} copied: {1} in {2}" -f $files.Count, (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
 }
 
 function Copy-FileWithProgress {
@@ -976,7 +995,7 @@ function Copy-FileWithProgress {
     try {
         $output = [IO.File]::Create($Destination)
         try {
-            $buffer = New-Object 'byte[]' 262144
+            $buffer = New-Object 'byte[]' 1048576
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $doneBytes = [double]0
             $speed = [double]0
