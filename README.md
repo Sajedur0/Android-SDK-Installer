@@ -8,7 +8,7 @@ A PowerShell 5.1+ installer for Windows 10/11. It installs the Android SDK under
 
 ### Menu options
 
-- **1. Android SDK Installation** — select a local command-line-tools ZIP, an extracted tools folder, or a direct download URL. The SDK packages are installed to `C:\Android`.
+- **1. Java SDK + Android SDK Installation** — installs Eclipse Temurin JDK 17, then the latest Google Android command-line tools, then the SDK packages under `C:\Android`. No folder, ZIP, or URL selection is needed.
 - **2. Flutter Installation** — select a Flutter ZIP, an extracted Flutter SDK folder, or a direct download URL. Flutter is installed to `C:\flutter`.
 - **3. Check Environment Paths** — inspect Java/JDK, Python, Android SDK, and Flutter environment variables, PATH entries, and required executables. This check is read-only.
 - **0. Exit** — close the installer.
@@ -19,16 +19,16 @@ Double-click `Run.bat` to open the menu. PowerShell asks for Administrator appro
 
 Choose **3. Check Environment Paths** to check the Machine, User, and current Process scopes. The read-only check reports `JAVA_HOME` and JDK executables, Python executables or the `py` launcher, Android SDK variables and tools, `FLUTTER_ROOT`, and whether their expected directories are in `PATH`. Python is checked only; this installer does not install it. Open a new terminal after a Machine or User PATH change.
 
-### Android SDK install flow
+### Java SDK + Android SDK install flow
 
-1. Choose **1** and paste the path to a folder, a ZIP file, or a direct URL.
-2. For a folder, the installer searches for files such as `commandlinetools-win-*_latest.zip`, `cmdline-tools*.zip`, and extracted `cmdline-tools` / `commandlinetools` folders. A folder containing an existing SDK layout is also supported. If several candidates are found, choose a number; pressing Enter selects the first (newest ZIPs are listed first).
-3. The selected tools are staged in a temporary folder and installed to `C:\Android\cmdline-tools\latest`. The original ZIP is never deleted. If the selected folder is an existing SDK root, its `platform-tools`, `platforms`, `build-tools`, licenses, NDK, CMake, emulator, and other SDK component folders are merged into `C:\Android` without deleting the source. Destination-only files are not deleted; files at matching paths may be refreshed from the selected source. Replaced command-line tools are kept in a timestamped backup.
-4. The installer installs **platform-tools**, **Android Platform 36**, and the latest available **Build Tools 36.x**. It also installs the latest stable **NDK** and **CMake** versions reported by the SDK package catalog when those packages are available.
-5. SDK license prompts are interactive. Read each prompt and enter `y` to accept. The installer does not silently accept third-party license agreements.
-6. It verifies the required files (`adb.exe`, `android.jar`, and `aapt2.exe`) before reporting success.
+Choose **1** and the installer runs these steps automatically:
 
-The Android Emulator and system images are not downloaded as new packages by default. If they already exist in the selected SDK root, they are copied over; otherwise, they are optional and not required just to compile an Android app. Install them separately if you want to run a virtual device.
+1. **Java SDK** — if no JDK 17+ is found, Eclipse Temurin JDK 17 is installed without a prompt. It uses `winget` when available, otherwise downloads Temurin JDK 17 from Adoptium.
+2. **Android command-line tools** — the latest Google command-line tools build is looked up from the Android developer download page (with a built-in fallback build if that page cannot be read), downloaded, and installed to `C:\Android\cmdline-tools\latest`. A previous `latest` folder is kept in a timestamped backup.
+3. **SDK packages** — accept the license prompts (enter `y`), then the installer installs **platform-tools**, **Android Platform 36**, and the latest available **Build Tools 36.x**, plus the latest stable **NDK** and **CMake** when the package catalog provides them. The installer does not silently accept third-party license agreements.
+4. **Environment** — `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` (when NDK is installed) are set, and Machine `PATH` receives the JDK `bin`, `cmdline-tools\latest\bin`, `platform-tools`, the latest `build-tools`, `emulator` (if present), and the latest `cmake\<version>\bin` (if present).
+
+Finally the installer verifies the required files (`adb.exe`, `android.jar`, and `aapt2.exe`) before reporting success. The Android Emulator and system images are not downloaded by default; install them separately with `sdkmanager` if you want a virtual device.
 
 ### Flutter install flow
 
@@ -45,6 +45,7 @@ The installer sets these at Machine scope and updates the current installer sess
 |---|---|---|
 | `ANDROID_HOME` | `C:\Android` | Android SDK location recommended by Android tooling |
 | `ANDROID_SDK_ROOT` | `C:\Android` | Compatibility with tools that still read the deprecated variable; kept equal to `ANDROID_HOME` |
+| `ANDROID_NDK_HOME` | Latest installed `C:\Android\ndk\<version>` | NDK location, set when the NDK is installed |
 | `JAVA_HOME` | Detected JDK 17+ location | JDK used by Gradle and Android builds |
 | `FLUTTER_ROOT` | `C:\flutter` | Flutter SDK location |
 | `PATH` | Android command-line tools, `platform-tools`, JDK `bin`, and `C:\flutter\bin` when installed | Run `sdkmanager`, `adb`, `java`, `git`, and `flutter` from a terminal |
@@ -57,7 +58,7 @@ Open a **new terminal** after installation so it receives the updated environmen
 - Administrator approval is required for the C-drive installs, Machine PATH, and system environment variables.
 - Internet is required to fetch SDK packages and optional JDK/Git prerequisites. `winget` is used when available; otherwise Temurin JDK 17 is downloaded from Adoptium and Git for Windows from GitHub.
 - Allow several GB of free disk space, especially when installing the NDK and CMake.
-- The installer does not delete an existing `C:\Android` SDK or the source ZIP. It preserves previous `latest` command-line tools and Flutter installations in timestamped backups.
+- The installer does not delete an existing `C:\Android` SDK. It preserves previous `latest` command-line tools and Flutter installations in timestamped backups.
 - The official `sdkmanager` tool is deprecated by Google. If an Android CLI executable is present, the installer uses `android sdk install`; otherwise it uses the compatible `sdkmanager.bat` interface.
 
 ### Verify
