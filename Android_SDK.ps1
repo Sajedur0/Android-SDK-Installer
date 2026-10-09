@@ -37,7 +37,34 @@ function Invoke-ExternalToHost {
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $Path @ArgumentList 2>&1 | Out-Host
+        # Merged native stderr arrives as ErrorRecord objects. Out-Host renders those as
+        # NativeCommandError blocks, so a plain tool warning looks like a script failure.
+        # Print the text of each line instead and keep only the exit code.
+        & $Path @ArgumentList 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Host $_.Exception.Message -ForegroundColor DarkYellow }
+            elseif ($null -ne $_) { Write-Host $_.ToString() }
+        }
+        $code = $LASTEXITCODE
+        return $code
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+}
+
+function Invoke-ExternalInteractive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$ArgumentList = @(),
+        [AllowEmptyCollection()][string[]]$Answers = @()
+    )
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        # Nothing is redirected here: the tool keeps the console, so prompts render as they are
+        # written, progress bars redraw in place, and keystrokes reach the tool. Piping the output
+        # through PowerShell hides prompts that do not end in a newline, which silently turns every
+        # "Accept? (y/N)" answer into the default "no".
+        if ($Answers.Count -gt 0) { $Answers | & $Path @ArgumentList } else { & $Path @ArgumentList }
         $code = $LASTEXITCODE
         return $code
     } finally {
@@ -46,11 +73,17 @@ function Invoke-ExternalToHost {
 }
 
 function Invoke-ExternalCapture {
-    param([Parameter(Mandatory = $true)][string]$Path, [string[]]$ArgumentList = @())
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$ArgumentList = @(),
+        [AllowEmptyCollection()][string[]]$Answers = @()
+    )
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $output = @(& $Path @ArgumentList 2>&1)
+        # -Answers keeps a captured run from blocking on a prompt it can never display.
+        if ($Answers.Count -gt 0) { $output = @($Answers | & $Path @ArgumentList 2>&1) }
+        else { $output = @(& $Path @ArgumentList 2>&1) }
         $code = $LASTEXITCODE
         return [pscustomobject]@{ Output = $output; ExitCode = $code }
     } finally {
@@ -226,7 +259,8 @@ function Install-WingetPackage {
     $winget = Get-WingetPath
     if (-not $winget) { throw "winget was not found. Install $DisplayName manually, then run this installer again." }
     Write-Host "[*] Starting winget installation for $DisplayName. Review and approve the package terms if prompted." -ForegroundColor Yellow
-    $code = Invoke-ExternalToHost -Path $winget -ArgumentList @('install', '--id', $PackageId, '--exact', '--scope', 'machine', '--accept-source-agreements')
+    # winget draws its own progress bar and may ask for source agreements, so keep the console attached.
+    $code = Invoke-ExternalInteractive -Path $winget -ArgumentList @('install', '--id', $PackageId, '--exact', '--scope', 'machine', '--accept-source-agreements')
     if ($code -ne 0) { throw "winget could not install $DisplayName (exit code $code)." }
     Refresh-ProcessPath
 }
@@ -1037,6 +1071,133 @@ function Find-ExtractedAndroidTools {
     return $null
 }
 
+function Get-SdkLicenseAnswers {
+    param([ValidateSet('y', 'n')][string]$Answer = 'y', [int]$Count = 40)
+    # One answer per license prompt, with spares for retries and per-package confirmations.
+    $answers = @()
+    for ($i = 0; $i -lt $Count; $i++) { $answers += $Answer }
+    return $answers
+}
+
+function Get-SdkLicenseStatusFromText {
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 'Unknown' }
+    $ansi = [string][char]27 + '\[[0-9;]*m'
+    $clean = ($Text -replace $ansi, '') -replace '\s+', ' '
+    if ($clean -match '(?i)all sdk package licenses (?:have been )?accepted') { return 'Accepted' }
+    $summary = [regex]::Match($clean, '(?i)(?<count>\d+) of (?<total>\d+) SDK package licenses not accepted')
+    if ($summary.Success) {
+        if ([int]$summary.Groups['count'].Value -eq 0) { return 'Accepted' }
+        return 'NotAccepted'
+    }
+    if ($clean -match '(?i)SDK package licenses? (?:have )?not (?:been )?accepted') { return 'NotAccepted' }
+    return 'Unknown'
+}
+
+function Test-SdkLicensesAccepted {
+    param([AllowEmptyString()][string]$SdkManager, [Parameter(Mandatory = $true)][string]$SdkRoot)
+    if ([string]::IsNullOrWhiteSpace($SdkManager) -or -not (Test-Path -LiteralPath $SdkManager -PathType Leaf)) { return $false }
+    # "n" answers keep a verification run from accepting anything on the user's behalf and stop it
+    # from waiting forever on a prompt whose text is captured instead of displayed.
+    $check = Invoke-ExternalCapture -Path $SdkManager -ArgumentList @("--sdk_root=$SdkRoot", '--licenses') -Answers (Get-SdkLicenseAnswers 'n')
+    $text = (@($check.Output | ForEach-Object { $_.ToString() }) -join "`n")
+    $status = Get-SdkLicenseStatusFromText $text
+    if ($status -eq 'Unknown') { return ($check.ExitCode -eq 0) }
+    return ($status -eq 'Accepted')
+}
+
+function Get-SdkLicenseFileHashes {
+    # License hashes published by Google. sdkmanager writes these files itself when it accepts a
+    # license, so they are only used when the tool cannot record an acceptance.
+    return [ordered]@{
+        'android-sdk-license'         = @('8933bad161af4178b1185d1a37fbf41ea5269c55', '24333f8a63b6825ea9c5514f83c2829b004d1fee', 'd56f5187479451eabf01fb78af6dfcb131a6481e')
+        'android-sdk-preview-license' = @('84831b9409646a918e30573bab4c9c91346d8abd')
+        'android-googletv-license'    = @('601085b94cd77f0b54ff86406957099ebe79c4d6')
+        'android-sdk-arm-dbt-license' = @('859f317696f67ef3d7f320ef9dff4ae5c47d97a4')
+        'google-gdk-license'          = @('33b6a2b64607f11b759f320ef9dff4ae5c47d97a')
+    }
+}
+
+function Write-SdkLicenseFiles {
+    param([Parameter(Mandatory = $true)][string]$SdkRoot)
+    $licensesRoot = Join-Path $SdkRoot 'licenses'
+    New-Item -ItemType Directory -Path $licensesRoot -Force | Out-Null
+    $published = Get-SdkLicenseFileHashes
+    $written = @()
+    foreach ($name in $published.Keys) {
+        $path = Join-Path $licensesRoot $name
+        $hashes = @()
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            # Keep hashes sdkmanager already recorded and add the published ones.
+            $hashes = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        foreach ($hash in $published[$name]) { if ($hashes -notcontains $hash) { $hashes += $hash } }
+        Set-Content -LiteralPath $path -Value ($hashes -join [Environment]::NewLine) -Encoding Ascii -Force
+        $written += $name
+    }
+    Write-Host "[+] SDK license files written to $licensesRoot ($($written -join ', '))" -ForegroundColor Green
+}
+
+function Accept-SdkLicenses {
+    param(
+        [AllowEmptyString()][string]$SdkManager,
+        [AllowEmptyString()][string]$AndroidCli,
+        [Parameter(Mandatory = $true)][string]$SdkRoot,
+        [ValidateSet('Auto', 'Review')][string]$Mode = 'Auto'
+    )
+    if ([string]::IsNullOrWhiteSpace($SdkManager)) {
+        if ($AndroidCli) { Write-Warning 'sdkmanager.bat is absent; the Android CLI will manage licenses during package installation.' }
+        else { Write-Warning 'No SDK license manager was found, so license acceptance cannot be verified.' }
+        return $true
+    }
+
+    $licenseArgs = @("--sdk_root=$SdkRoot", '--licenses')
+    $licensesRoot = Join-Path $SdkRoot 'licenses'
+    $recorded = @(Get-ChildItem -LiteralPath $licensesRoot -File -ErrorAction SilentlyContinue)
+
+    # A verification run contacts the package repository, so only spend one up front when license
+    # files already exist. A fresh SDK goes straight to acceptance.
+    if ($recorded.Count -gt 0) {
+        Write-Host "[*] Checking the licenses already recorded under $licensesRoot..." -ForegroundColor Yellow
+        if (Test-SdkLicensesAccepted -SdkManager $SdkManager -SdkRoot $SdkRoot) {
+            Write-Host '[+] All Android SDK licenses are already accepted.' -ForegroundColor Green
+            return $true
+        }
+    }
+
+    if ($Mode -eq 'Review') {
+        Write-Host '[*] Review the Android SDK licenses and enter Y at each prompt to accept it.' -ForegroundColor Yellow
+        [void](Invoke-ExternalInteractive -Path $SdkManager -ArgumentList $licenseArgs)
+    } else {
+        Write-Host '[*] Accepting the Android SDK licenses (this refreshes the package catalog and can take a minute)...' -ForegroundColor Yellow
+        [void](Invoke-ExternalInteractive -Path $SdkManager -ArgumentList $licenseArgs -Answers (Get-SdkLicenseAnswers 'y'))
+    }
+    Write-Host '[*] Verifying that every license was recorded...' -ForegroundColor Yellow
+    if (Test-SdkLicensesAccepted -SdkManager $SdkManager -SdkRoot $SdkRoot) {
+        Write-Host '[+] All Android SDK licenses accepted.' -ForegroundColor Green
+        return $true
+    }
+
+    Write-Warning 'sdkmanager did not record the accepted licenses. Writing the SDK license files directly...'
+    Write-SdkLicenseFiles -SdkRoot $SdkRoot
+    Write-Host '[*] Verifying the written license files...' -ForegroundColor Yellow
+    if (Test-SdkLicensesAccepted -SdkManager $SdkManager -SdkRoot $SdkRoot) {
+        Write-Host '[+] All Android SDK licenses accepted.' -ForegroundColor Green
+        return $true
+    }
+
+    if ($Mode -eq 'Auto') {
+        Write-Host '[*] Automatic acceptance did not stick. Review the prompts and enter Y at each one.' -ForegroundColor Yellow
+        [void](Invoke-ExternalInteractive -Path $SdkManager -ArgumentList $licenseArgs)
+        Write-Host '[*] Verifying that every license was recorded...' -ForegroundColor Yellow
+        if (Test-SdkLicensesAccepted -SdkManager $SdkManager -SdkRoot $SdkRoot) {
+            Write-Host '[+] All Android SDK licenses accepted.' -ForegroundColor Green
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-AvailableSdkPackages {
     param([string]$SdkManager, [string]$SdkRoot)
     $packages = @()
@@ -1069,15 +1230,22 @@ function Get-LatestSdkPackage {
 
 function Install-SdkPackages {
     param([AllowEmptyString()][string]$SdkManager, [AllowEmptyString()][string]$AndroidCli, [string]$SdkRoot, [string[]]$Packages)
-    if ($AndroidCli -and (Test-Path -LiteralPath $AndroidCli -PathType Leaf)) {
+    # Installs run with the console attached so the tool's own progress and any late license prompt
+    # stay visible and answerable.
+    $cliUsable = [bool]($AndroidCli -and (Test-Path -LiteralPath $AndroidCli -PathType Leaf))
+    $managerUsable = [bool]($SdkManager -and (Test-Path -LiteralPath $SdkManager -PathType Leaf))
+    if ($cliUsable) {
         $cliPackages = @($Packages | ForEach-Object { $_ -replace ';', '/' })
         Write-Host "[*] Installing with Android CLI: $($cliPackages -join ', ')" -ForegroundColor Yellow
         $cliArgs = @("--sdk=$SdkRoot", 'sdk', 'install') + $cliPackages
-        return (Invoke-ExternalToHost -Path $AndroidCli -ArgumentList $cliArgs)
+        $cliCode = Invoke-ExternalInteractive -Path $AndroidCli -ArgumentList $cliArgs
+        if (($cliCode -eq 0) -or -not $managerUsable) { return $cliCode }
+        Write-Warning "The Android CLI returned $cliCode. Retrying the same packages with sdkmanager..."
     }
+    if (-not $managerUsable) { return 1 }
     Write-Host "[*] Installing with sdkmanager: $($Packages -join ', ')" -ForegroundColor Yellow
     $managerArgs = @("--sdk_root=$SdkRoot") + $Packages
-    return (Invoke-ExternalToHost -Path $SdkManager -ArgumentList $managerArgs)
+    return (Invoke-ExternalInteractive -Path $SdkManager -ArgumentList $managerArgs)
 }
 
 function Get-LatestVersionFolder {
@@ -1177,12 +1345,15 @@ function Install-AndroidSdk {
         if (-not (Test-Path -LiteralPath $androidCli -PathType Leaf)) { $androidCli = '' }
         if (-not $sdkManager -and -not $androidCli) { throw 'No usable SDK package manager was found after extraction.' }
 
-        if ($sdkManager) {
-            Write-Host ''
-            Write-Host '[*] Review the Android SDK license prompts and enter Y to accept each license.' -ForegroundColor Yellow
-            $licenseCode = Invoke-ExternalToHost -Path $sdkManager -ArgumentList @("--sdk_root=$script:SdkRoot", '--licenses')
-            if ($licenseCode -ne 0) { throw "SDK license setup failed (sdkmanager exit code $licenseCode)." }
-        } else { Write-Warning 'sdkmanager.bat is absent; the Android CLI will manage licenses during package installation.' }
+        Write-Host ''
+        Write-Host '[*] Android SDK packages can only be downloaded after their licenses are accepted.' -ForegroundColor Yellow
+        $licenseChoice = (Read-Host 'Accept every Android SDK license now? (Y = accept all, N = answer each prompt yourself)').Trim()
+        $licenseMode = if ($licenseChoice -match '^[Nn]') { 'Review' } else { 'Auto' }
+        $licenseCommand = if ($sdkManager) { "`"$sdkManager`" --sdk_root=$script:SdkRoot --licenses" } else { "the Android CLI in $bin" }
+        $licensesAccepted = Accept-SdkLicenses -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot -Mode $licenseMode
+        if (-not $licensesAccepted) {
+            throw "The Android SDK licenses were not accepted, so no package can be installed. Run $licenseCommand, enter Y at each prompt, then choose option 1 again."
+        }
 
         $available = @()
         if ($sdkManager) { $available = @(Get-AvailableSdkPackages $sdkManager $script:SdkRoot) }
@@ -1190,7 +1361,14 @@ function Install-AndroidSdk {
         if (-not $buildTools) { $buildTools = 'build-tools;36.0.0' }
         $corePackages = @('platform-tools', 'platforms;android-36', $buildTools)
         $coreCode = Install-SdkPackages $sdkManager $androidCli $script:SdkRoot $corePackages
-        if ($coreCode -ne 0) { throw "Core SDK installation failed (exit code $coreCode). Check network access and license prompts." }
+        if (($coreCode -ne 0) -and $sdkManager -and -not (Test-SdkLicensesAccepted -SdkManager $sdkManager -SdkRoot $script:SdkRoot)) {
+            # A declined license surfaces as a failed install, so offer the prompts once more.
+            Write-Warning 'Some licenses are still unaccepted. Enter Y at each prompt, then the install runs again.'
+            if (Accept-SdkLicenses -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot -Mode 'Review') {
+                $coreCode = Install-SdkPackages $sdkManager $androidCli $script:SdkRoot $corePackages
+            }
+        }
+        if ($coreCode -ne 0) { throw "Core SDK installation failed (exit code $coreCode). Check network access and the license prompts: $licenseCommand" }
 
         $native = @()
         $cmake = Get-LatestSdkPackage $available 'cmake'
@@ -1299,10 +1477,12 @@ function Install-Flutter {
         if (Test-Path -LiteralPath $sdkPlatform -PathType Leaf) {
             Set-AndroidEnvironment
             Write-Host '[*] Connecting Flutter to C:\Android...' -ForegroundColor Yellow
-            $configCode = Invoke-ExternalToHost -Path $flutterBat -ArgumentList @('config', '--android-sdk', $script:SdkRoot)
+            $configCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('config', '--android-sdk', $script:SdkRoot)
             if ($configCode -ne 0) { Write-Warning "Flutter could not save the SDK path (exit code $configCode); ANDROID_HOME is still set." }
-            Write-Host '[*] Checking Android SDK licenses through Flutter...' -ForegroundColor Yellow
-            $licenseCode = Invoke-ExternalToHost -Path $flutterBat -ArgumentList @('doctor', '--android-licenses')
+            Write-Host '[*] Confirming the Android SDK licenses through Flutter (they were accepted during the Android SDK installation)...' -ForegroundColor Yellow
+            # Flutter re-asks "Accept? (y/N)" per license, so answer them instead of stalling on a
+            # prompt that a captured run would never display.
+            $licenseCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('doctor', '--android-licenses') -Answers (Get-SdkLicenseAnswers 'y')
             if ($licenseCode -ne 0) { Write-Warning "Flutter's license check returned $licenseCode. Review its output and the SDK license files." }
         } else {
             Write-Warning 'Android Platform 36 was not found in C:\Android. Run Android SDK Installation first to build Android apps with Flutter.'
@@ -1311,11 +1491,11 @@ function Install-Flutter {
         Add-PathEntry $flutterBin 'Machine'
         Broadcast-EnvironmentChange
         Write-Host '[*] Verifying Flutter installation...' -ForegroundColor Yellow
-        $versionCode = Invoke-ExternalToHost -Path $flutterBat -ArgumentList @('--version')
+        $versionCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('--version')
         if ($versionCode -ne 0) { throw "flutter --version failed (exit code $versionCode). Files remain in C:\flutter for troubleshooting." }
         if (Test-Path -LiteralPath $sdkPlatform -PathType Leaf) {
             Write-Host '[*] Running flutter doctor -v...' -ForegroundColor Yellow
-            $doctorCode = Invoke-ExternalToHost -Path $flutterBat -ArgumentList @('doctor', '-v')
+            $doctorCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('doctor', '-v')
             if ($doctorCode -ne 0) { Write-Warning "flutter doctor reported unresolved checks (exit code $doctorCode); Flutter itself passed the version check." }
         }
         Write-Host ''
@@ -1500,6 +1680,13 @@ function Show-EnvironmentPathStatus {
         Write-EnvironmentCheckResult 'MISSING' "sdkmanager.bat or android.exe was not found under $cmdlineBin"
     }
     Write-EnvironmentPathEntryCheck $cmdlineBin 'Android command-line tools'
+    $sdkLicenses = Join-Path $androidRoot 'licenses'
+    if (Test-Path -LiteralPath (Join-Path $sdkLicenses 'android-sdk-license') -PathType Leaf) {
+        $licenseCount = @(Get-ChildItem -LiteralPath $sdkLicenses -File -ErrorAction SilentlyContinue).Count
+        Write-EnvironmentCheckResult 'OK' "Accepted SDK licenses are recorded under $sdkLicenses ($licenseCount file(s))"
+    } else {
+        Write-EnvironmentCheckResult 'MISSING' "No accepted SDK licenses were found under $sdkLicenses. Run: `"$sdkManager`" --sdk_root=$androidRoot --licenses"
+    }
 
     Write-Host ''
     Write-Host '--- Flutter ---' -ForegroundColor Yellow
