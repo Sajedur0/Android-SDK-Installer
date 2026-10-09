@@ -34,7 +34,7 @@ The Android Emulator and system images are not downloaded as new packages by def
 
 1. Choose **2** and paste a folder, ZIP path, or direct URL. The folder search accepts `flutter*.zip` and already-extracted Flutter SDK folders.
 2. Flutter is staged before replacing `C:\flutter`; any previous installation is preserved in a timestamped backup. The selected source file is not deleted.
-3. The installer checks for a **JDK 17+** and **Git for Windows**. If either is missing, it offers to install Temurin JDK 17 or Git using `winget`. Review and approve the package installer terms if prompted.
+3. The installer checks for a **JDK 17+** and **Git for Windows**. If either is missing, it offers to install Temurin JDK 17 or Git. It uses `winget` when that command is available (including the real App Installer copy, which elevated sessions often miss on PATH). If `winget` is absent or fails, it downloads Eclipse Temurin JDK 17 from Adoptium and Git for Windows from GitHub. Review and approve package terms if a GUI installer is shown.
 4. Flutter's `bin` is added to Machine `PATH`. If Android Platform 36 is installed under `C:\Android`, the installer sets Flutter's Android SDK path and runs the Android license check and `flutter doctor -v`.
 
 ### Environment variables
@@ -55,7 +55,7 @@ Open a **new terminal** after installation so it receives the updated environmen
 
 - Windows 10 or Windows 11; Windows PowerShell 5.1 or later.
 - Administrator approval is required for the C-drive installs, Machine PATH, and system environment variables.
-- Internet is required to fetch SDK packages and optional Winget prerequisites.
+- Internet is required to fetch SDK packages and optional JDK/Git prerequisites. `winget` is used when available; otherwise Temurin JDK 17 is downloaded from Adoptium and Git for Windows from GitHub.
 - Allow several GB of free disk space, especially when installing the NDK and CMake.
 - The installer does not delete an existing `C:\Android` SDK or the source ZIP. It preserves previous `latest` command-line tools and Flutter installations in timestamped backups.
 - The official `sdkmanager` tool is deprecated by Google. If an Android CLI executable is present, the installer uses `android sdk install`; otherwise it uses the compatible `sdkmanager.bat` interface.
