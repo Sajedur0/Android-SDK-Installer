@@ -1369,6 +1369,10 @@ function Install-AndroidSdk {
             }
         }
         if ($coreCode -ne 0) { throw "Core SDK installation failed (exit code $coreCode). Check network access and the license prompts: $licenseCommand" }
+        # platform-tools did not exist during the Step 2 call above, so its PATH entry was skipped.
+        # Persist PATH now that the core packages are installed, so a later verification failure
+        # cannot leave platform-tools (adb) missing from Machine PATH. Step 4 repeats this (idempotent).
+        Set-AndroidEnvironment
 
         $native = @()
         $cmake = Get-LatestSdkPackage $available 'cmake'
