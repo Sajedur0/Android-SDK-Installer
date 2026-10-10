@@ -42,7 +42,12 @@ $wanted = @(
     'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
     'Get-SmoothedSpeed', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
     'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress',
-    'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles'
+    'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles',
+    'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Get-VolumeFreeBytes', 'Assert-DiskSpace',
+    'Get-FileSha256', 'Test-FileSha256', 'Test-InteractiveConsoleHost', 'Read-InstallerInput',
+    'Get-SdkPackageMarkerPath', 'Test-SdkPackagePresent', 'Get-InstalledSdkPackagesOnDisk', 'Get-PartialSdkPackageFolders',
+    'Test-SdkPackageInstalled', 'Get-SdkPackageNamesFromText', 'Get-LatestSdkPackage', 'Get-LatestVersionFolder',
+    'Test-CmdlineToolsDirectory', 'Test-AndroidSdkRoot', 'Get-SdkPackageManagerHint'
 )
 $definitions = $ast.FindAll({
         param($node)
@@ -242,6 +247,10 @@ try { Download-File 'https://raw.githubusercontent.com/Sajedur0/Android-SDK-Inst
 catch { $failed = $true }
 Assert-True $failed 'A 404 download raises an error'
 Assert-True (-not (Test-Path -LiteralPath $failedTarget)) 'A failed download leaves no partial file'
+Assert-True (-not (Test-Path -LiteralPath "$failedTarget.part")) 'A failed download leaves no resumable chunk either'
+if (Test-Path -LiteralPath $downloadTarget) {
+    Assert-True (-not (Test-Path -LiteralPath "$downloadTarget.part")) 'A finished download moves its partial file into place'
+}
 
 # --- 8. Android SDK license helpers -------------------------------------------
 Write-Host "`n[8] Android SDK license helpers" -ForegroundColor Yellow
@@ -300,6 +309,127 @@ $entriesBlock = [regex]::Match($scriptText, '(?s)\$entries = @\(.*?\r?\n    \)')
 Assert-True ($entriesBlock.Length -gt 0) 'The Machine PATH entry list was found'
 Assert-True ($entriesBlock -notmatch 'emulator') 'The Emulator folder is not an automatic PATH entry'
 Assert-True ($scriptText -match 'Get-PathEntryScopes \$emulatorRoot') 'The environment check reports the Emulator PATH state'
+
+# --- 10. Installed, incomplete, or absent: package markers -------------------
+Write-Host "`n[10] SDK package markers" -ForegroundColor Yellow
+$fakeSdk = Join-Path $work 'fake-sdk'
+foreach ($dir in @('ndk\30.0.16248370', 'ndk\27.0.12077973', 'cmake\3.22.1\bin', 'platform-tools', 'platforms\android-36')) {
+    $null = New-Item -ItemType Directory -Path (Join-Path $fakeSdk $dir) -Force
+}
+Set-Content -LiteralPath (Join-Path $fakeSdk 'ndk\30.0.16248370\source.properties') -Value 'Pkg.Desc = Android NDK' -Encoding Ascii
+foreach ($file in @('cmake\3.22.1\bin\cmake.exe', 'platform-tools\adb.exe', 'platforms\android-36\android.jar')) {
+    Set-Content -LiteralPath (Join-Path $fakeSdk $file) -Value 'stub' -Encoding Ascii
+}
+
+Assert-Equal (Join-Path $fakeSdk 'ndk\30.0.16248370\source.properties') (Get-SdkPackageMarkerPath -SdkRoot $fakeSdk -Package 'ndk;30.0.16248370') 'The NDK marker is source.properties'
+Assert-Equal (Join-Path $fakeSdk 'cmake\3.22.1\bin\cmake.exe') (Get-SdkPackageMarkerPath -SdkRoot $fakeSdk -Package 'cmake;3.22.1') 'The CMake marker is its own executable'
+Assert-Equal (Join-Path $fakeSdk 'platforms\android-36\android.jar') (Get-SdkPackageMarkerPath -SdkRoot $fakeSdk -Package 'platforms;android-36') 'The platform marker is android.jar'
+Assert-Equal '' (Get-SdkPackageMarkerPath -SdkRoot $fakeSdk -Package 'unknown;1.0') 'An unknown package has no marker'
+Assert-True (Test-SdkPackagePresent -SdkRoot $fakeSdk -Package 'ndk;30.0.16248370') 'A complete NDK counts as installed'
+Assert-True (-not (Test-SdkPackagePresent -SdkRoot $fakeSdk -Package 'ndk;27.0.12077973')) 'A folder without its marker is not installed'
+Assert-Equal (Join-Path $fakeSdk 'ndk\30.0.16248370') (Get-LatestVersionFolder (Join-Path $fakeSdk 'ndk') 'source.properties') 'Only complete version folders are selected'
+$partialFolders = @(Get-PartialSdkPackageFolders -SdkRoot $fakeSdk)
+Assert-Equal 'ndk\27.0.12077973' ($partialFolders -join ',') 'The half-extracted NDK folder is reported'
+
+$null = New-Item -ItemType Directory -Path (Join-Path $fakeSdk 'build-tools\36.0.0') -Force
+Set-Content -LiteralPath (Join-Path $fakeSdk 'build-tools\36.0.0\aapt2.exe') -Value 'stub' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $fakeSdk 'build-tools\36.0.0\package.xml') -Value '<repository><ns2:localPackage path="build-tools;36.0.0" obsolete="false"><file-size>1</file-size></ns2:localPackage></repository>' -Encoding Ascii
+$installed = @(Get-InstalledSdkPackagesOnDisk $fakeSdk)
+Assert-True ($installed -contains 'build-tools;36.0.0') 'package.xml is read back as installed'
+Assert-True ($installed -contains 'platform-tools') 'adb.exe marks platform-tools as installed'
+Assert-True ($installed -contains 'ndk;30.0.16248370') 'A complete NDK is recognised without package.xml'
+Assert-True (-not ($installed -contains 'ndk;27.0.12077973')) 'An incomplete NDK is never advertised as installed'
+Assert-True (Test-SdkPackageInstalled -Installed $installed -Package 'PLATFORM-TOOLS') 'The membership check ignores case'
+Assert-True (Test-AndroidSdkRoot $fakeSdk) 'A folder holding adb.exe counts as an Android SDK'
+Assert-True (-not (Test-AndroidSdkRoot $work)) 'A random folder is not an Android SDK'
+
+# --- 11. The package catalog is parsed the same way by both tools -----------
+Write-Host "`n[11] SDK package catalog parsing" -ForegroundColor Yellow
+$catalogLines = @(
+    'Loading package information...',
+    '  build-tools;36.0.0       | 36.0.0         | Android SDK Build-Tools 36        | build-tools/36.0.0',
+    '  cmake;3.22.1             | 3.22.1         | CMake 3.22.1                      | cmake/3.22.1',
+    '  cmake;4.1.2              | 4.1.2          | CMake 4.1.2                       | cmake/4.1.2',
+    '  ndk;30.0.16248370        | 30.0.16248370  | NDK (Side by side) 30.0.16248370 | ndk/30.0.16248370',
+    '  ndk/26.1.10909125        | 26.1.10909125  | NDK (Side by side)                | ndk/26.1.10909125',
+    'Patch file                       | obsolete'
+)
+$parsed = @(Get-SdkPackageNamesFromText ($catalogLines -join "`n"))
+Assert-True ($parsed -contains 'build-tools;36.0.0') 'Build Tools are parsed from the table'
+Assert-True ($parsed -contains 'cmake;3.22.1') 'CMake versions are parsed'
+Assert-True ($parsed -contains 'ndk;30.0.16248370') 'NDK versions are parsed'
+Assert-True ($parsed -contains 'ndk;26.1.10909125') 'The Android CLI slash separator is normalised'
+Assert-True (-not ($parsed -contains 'Patch file')) 'Unrelated rows are ignored'
+Assert-Equal 'build-tools;36.0.0' (Get-LatestSdkPackage $parsed 'build-tools' '36') 'The requested Build Tools major is honoured'
+Assert-Equal 'cmake;3.22.1' (Get-LatestSdkPackage $parsed 'cmake' '3') 'CMake 3.x wins when a major is requested'
+Assert-Equal 'cmake;4.1.2' (Get-LatestSdkPackage $parsed 'cmake') 'Without a major the newest CMake is chosen'
+Assert-Equal 'ndk;30.0.16248370' (Get-LatestSdkPackage $parsed 'ndk') 'The newest NDK is chosen'
+Assert-Equal '' (Get-LatestSdkPackage $parsed 'patch') 'An absent package resolves to nothing'
+
+# --- 12. Disk space, hashes, and prompts that cannot be answered ------------
+Write-Host "`n[12] Disk space, hashes, and prompt safety" -ForegroundColor Yellow
+Assert-True ((Get-VolumeFreeBytes $work) -gt 0) 'Free space of the test folder is measurable'
+$diskOk = $true
+try { Assert-DiskSpace -Path $work -RequiredBytes 1 -Label 'the test' } catch { $diskOk = $false }
+Assert-True $diskOk 'A small disk-space requirement passes'
+$diskThrew = $false
+try { Assert-DiskSpace -Path $work -RequiredBytes 1PB -Label 'the test' } catch { $diskThrew = $true }
+Assert-True $diskThrew 'An impossible disk-space requirement is refused before downloading'
+
+$hashFile = Join-Path $work 'hash-me.txt'
+Set-Content -LiteralPath $hashFile -Value 'android-sdk-installer' -Encoding Ascii
+$hash = Get-FileSha256 $hashFile
+Assert-True ($hash -match '^[0-9A-F]{64}$') 'SHA-256 is computed for a download'
+Assert-True (Test-FileSha256 -Path $hashFile -Expected $hash.ToLowerInvariant()) 'A published hash is compared case-insensitively'
+Assert-True (-not (Test-FileSha256 -Path $hashFile -Expected ('0' * 64))) 'A mismatching hash is rejected'
+Assert-True (Test-FileSha256 -Path $hashFile) 'No published hash means nothing to verify'
+
+# A prompt that nobody can answer has to fall back to its default, never hang the run.
+$env:ANDROID_SDK_INSTALLER_ASSUME_NONINTERACTIVE = '1'
+try {
+    Assert-True (-not (Test-InteractiveConsoleHost)) 'A non-interactive session is detected'
+    Assert-Equal 'Y' (Read-InstallerInput -Prompt 'unanswered prompt' -Default 'Y' -Choices 'Y|N') 'An unanswered prompt uses its default'
+    Assert-Equal 'the Android SDK command-line tools --licenses' (Get-SdkPackageManagerHint -SdkManager (Join-Path $work 'no-such\sdkmanager.bat') -AndroidCli '' -SdkRoot 'C:\Android' -Arguments '--licenses') 'A missing package manager is named generically'
+    $fakeManager = Join-Path $fakeSdk 'cmdline-tools\bin\sdkmanager.bat'
+    $null = New-Item -ItemType Directory -Path (Split-Path -Parent $fakeManager) -Force
+    Set-Content -LiteralPath $fakeManager -Value '@echo off' -Encoding Ascii
+    $hint = Get-SdkPackageManagerHint -SdkManager $fakeManager -AndroidCli '' -SdkRoot $fakeSdk -Arguments 'install "ndk;30.0.16248370"'
+    Assert-True ($hint.Contains($fakeManager)) 'An existing sdkmanager is named in the repair hint'
+    Assert-True ($hint -match '--sdk_root=') 'The repair hint repeats the SDK root'
+} finally {
+    Remove-Item -LiteralPath 'Env:\ANDROID_SDK_INSTALLER_ASSUME_NONINTERACTIVE' -ErrorAction SilentlyContinue
+}
+
+# --- 13. The raw PATH is preserved, and the expanding API is not used -------
+Write-Host "`n[13] PATH handling" -ForegroundColor Yellow
+Assert-Equal 'C:\Android\platform-tools' (Normalize-PathEntry 'C:\Android\platform-tools\') 'A trailing separator is removed'
+Assert-Equal '' (Normalize-PathEntry '   ') 'A blank entry normalizes to empty'
+$rawPath = Get-RawPathVariable -Scope 'Machine'
+Assert-True ($null -ne $rawPath) 'The raw Machine PATH can be read'
+Assert-True (@($rawPath.PSObject.Properties.Name) -contains 'Expandable') 'The raw value reports its registry kind'
+$registryCatalog = Get-ShortHash 'C:\Android'
+Assert-True ($registryCatalog -match '^[0-9a-f]{12}$') 'Cache file names are derived from the SDK root'
+$emptyCatalogName = Get-ShortHash ''
+Assert-Equal 'default' $emptyCatalogName 'An unknown SDK root still gets a usable cache name'
+
+# --- 14. Regression guards for the fixes themselves --------------------------
+Write-Host "`n[14] Regression guards" -ForegroundColor Yellow
+$acceptFunction = [regex]::Match($scriptText, '(?s)function Accept-SdkLicenses.*?\r?\n}\r?\n').Value
+$acceptPlain = $acceptFunction -replace '\s+', ' '
+Assert-True ($acceptPlain -match "Mode -ne 'Auto'") 'Declined licenses are never written by hand in review mode'
+Assert-True ($scriptText -match '-SkipInstalled') 'Already installed packages are skipped before a retry'
+Assert-True ($scriptText -notmatch 'Retrying the same packages') 'A failed Android CLI does not re-download every package'
+Assert-True ($scriptText -match 'PARTIAL') 'A core-only install is reported as partial, not verified'
+Assert-True ($scriptText -match 'Get-PartialSdkPackageFolders') 'Incomplete package folders are named, not advertised'
+Assert-True ($scriptText -match 'AddRange') 'Interrupted downloads resume instead of starting over'
+Assert-True ($scriptText -match 'Test-FileSha256') 'Downloads are hash-verified when a hash is published'
+Assert-True ($scriptText -match 'Assert-DiskSpace') 'Free space is checked before a multi-gigabyte download'
+Assert-True ($scriptText -match 'JdkMaxMajor') 'A JDK newer than Gradle supports is kept out of JAVA_HOME'
+Assert-True ($scriptText -notmatch "\[Environment\]::SetEnvironmentVariable\('Path',\s*\`$newValue") 'PATH is written through the raw registry helper'
+Assert-True ($scriptText -match 'exit 1') 'A handled failure leaves a non-zero exit code'
+Assert-Equal 2 ([regex]::Matches($scriptText, 'Read-Host')).Count 'Only the guarded helpers read the console'
+$flutterSection = [regex]::Match($scriptText, '(?s)function Install-Flutter.*?FLUTTER INSTALLATION VERIFIED').Value
+Assert-True ($flutterSection -notmatch "Get-SdkLicenseAnswers 'y'\)") 'Flutter does not accept licenses by default'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
