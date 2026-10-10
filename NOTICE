@@ -1,0 +1,26 @@
+Android SDK & Flutter Installer for Windows
+Copyright 2026 Sajedur Rahman Roni and project contributors
+
+This product includes software developed as part of
+https://github.com/Sajedur0/Android-SDK-Installer.
+
+The installer downloads and installs third-party components that carry their own
+licenses. Neither this NOTICE nor the Apache License, Version 2.0 in LICENSE relieves
+you of those terms or grants you any rights in them:
+
+  - Eclipse Temurin JDK (Adoptium)
+      Eclipse Public License, Version 2.0 with the GNU General Public License,
+      Version 2 with the Classpath Exception.
+  - Google Android SDK components: command-line tools, platform-tools, platforms,
+    build-tools, NDK, CMake, emulator and system images
+      The Android SDK license terms, accepted by the user through
+      "sdkmanager --licenses". This installer never accepts them without an
+      explicit choice.
+  - Flutter SDK
+      BSD 3-Clause "New" or "Revised" License.
+  - Git for Windows
+      GNU General Public License, Version 2.
+
+The installer itself writes no license-acceptance state on behalf of a third party,
+keeps its backups and caches outside any folder it installs, and deletes no SDK, JDK,
+or Flutter installation that it did not create.
