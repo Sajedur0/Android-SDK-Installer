@@ -1,5 +1,7 @@
 # Android SDK & Flutter Installer for Windows
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 A PowerShell 5.1+ installer for Windows 10/11. It installs the Android SDK under `C:\Android` and Flutter under `C:\flutter`, without requiring the Android Studio IDE. The installer requests Administrator privileges because it updates Machine environment variables and installs under the root of `C:`.
 
 ---
@@ -172,11 +174,36 @@ For the SDK package list, use `android sdk list` if the Android CLI is installed
 |---|---|
 | `Android_SDK.ps1` | Main installer and menu |
 | `Run.bat` | Launcher; PowerShell handles UAC elevation |
-| `tests/Progress.Tests.ps1` | Progress-bar, extraction, and copy tests for Windows PowerShell 5.1 and PowerShell 7 |
+| `tests/Progress.Tests.ps1` | Helper tests for Windows PowerShell 5.1 and PowerShell 7: progress bar, extraction, copies, package markers, catalog parsing, disk space, hashes, prompts, and PATH handling |
 | `tests/Progress.Demo.ps1` | Animates the real progress bar with simulated transfers; downloads nothing |
+| `LICENSE` | Apache License 2.0, kept word-for-word canonical so license scanners recognise it |
+| `NOTICE` | Copyright line and the licenses of the components the installer downloads |
 | `.gitattributes` | Keeps Windows batch files on CRLF line endings |
 | `README.md` | This guide |
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+Apache License 2.0 — the full text ships in [`LICENSE`](LICENSE), so a copy of this repository already
+satisfies section 4(a), and [`NOTICE`](NOTICE) carries the attribution. The `LICENSE` file is kept
+word-for-word canonical, with the appendix placeholders unreplaced, because editing it breaks GitHub's
+and other scanners' license detection. Put your own copyright notice in your copies of the files instead:
+
+```
+Copyright 2026 Sajedur Rahman Roni
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+The JDK, Android SDK packages, Flutter, and Git that the installer downloads keep their own licenses;
+this license grants no rights in them. Accepting the Android SDK license terms is always the user's own
+action through `sdkmanager --licenses`, never something the installer does without being asked.
