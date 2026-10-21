@@ -2951,6 +2951,28 @@ function Show-EnvironmentPathStatus {
     else { Write-EnvironmentCheckResult 'MISSING' 'javac.exe was not found in Machine, User, or Process PATH.' }
 
     Write-Host ''
+    Write-Host '--- Git for Windows ---' -ForegroundColor Yellow
+    $gitCommand = Find-EnvironmentPathExecutable @('git.exe')
+    $gitFolder = ''
+    if ($gitCommand) {
+        $gitFolder = Split-Path -Parent $gitCommand.Path
+        Write-EnvironmentCheckResult 'OK' "git.exe is available from $($gitCommand.Scope) PATH: $($gitCommand.Path)"
+    } else {
+        # Git may be installed with a PATH entry that this shell has not picked up yet, so look in
+        # the default install folders before reporting it missing.
+        $gitCandidates = @((Join-Path $env:ProgramFiles 'Git\cmd\git.exe'), (Join-Path $env:ProgramFiles 'Git\bin\git.exe'))
+        if (${env:ProgramFiles(x86)}) { $gitCandidates += (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe') }
+        $gitInstalled = @($gitCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }) | Select-Object -First 1
+        if ($gitInstalled) {
+            $gitFolder = Split-Path -Parent $gitInstalled
+            Write-EnvironmentCheckResult 'WARN' "Git for Windows is installed at $gitInstalled, but its folder is not on PATH yet. Open a new terminal."
+        } else {
+            Write-EnvironmentCheckResult 'WARN' 'Git for Windows was not found. Flutter needs it; option 2 installs it when you accept the prompt.'
+        }
+    }
+    if ($gitFolder) { Write-EnvironmentPathEntryCheck $gitFolder 'the Git folder' }
+
+    Write-Host ''
     Write-Host '--- Python ---' -ForegroundColor Yellow
     $pythonCommand = Find-EnvironmentPathExecutable @('python.exe', 'python3.exe')
     if ($pythonCommand) {

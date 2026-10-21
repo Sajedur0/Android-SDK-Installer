@@ -110,6 +110,7 @@ Status: Java 17 OK | SDK 36 OK | Flutter OK | Emulator OK | 1 AVD(s)
 কিছুই ইনস্টল বা পরিবর্তন করে না। দেখায়:
 
 - `JAVA_HOME`, `java.exe`/`javac.exe`, এবং PATH-এ কোথায় আছে
+- Git for Windows (`git.exe`) এবং তার PATH অবস্থা
 - Python (শুধু পরীক্ষা — ইনস্টলার Python ইনস্টল করে না)
 - `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `adb`, `sdkmanager`/`android.exe`, লাইসেন্স ফাইল
 - platform-tools, Platform, Build Tools, NDK, CMake-এর উপস্থিতি ও অসম্পূর্ণ ফোল্ডার

@@ -503,6 +503,7 @@ Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_EMULATOR_PATH') 'The Emul
 Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_NO_AVD') 'AVD creation can be skipped'
 Assert-True ($scriptText -match "WindowsPowerShell\\v1\.0\\powershell\.exe") 'Elevation uses the Windows PowerShell 5.1 host'
 Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD') 'The automatic Flutter download can be enabled unattended'
+Assert-True ($scriptText -match '--- Git for Windows ---') 'The environment check covers Git'
 
 # --- 17. The automatic Flutter release lookup --------------------------------
 Write-Host "`n[17] Flutter release cache" -ForegroundColor Yellow
