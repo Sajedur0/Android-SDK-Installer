@@ -5,17 +5,34 @@ param(
     # Where the SDK goes. Left empty, an ANDROID_HOME that already points at a usable SDK wins.
     [string]$SdkRoot = '',
     # Android API level (and the Build Tools major) to install. 0 keeps the built-in default.
-    [int]$ApiLevel = 0
+    [int]$ApiLevel = 0,
+    # Where Flutter goes. Left empty, ANDROID_SDK_INSTALLER_FLUTTER_ROOT or C:\flutter wins.
+    [string]$FlutterRoot = '',
+    # Name of the virtual device option 4 creates. Left empty, Pixel_Api<level> is used.
+    [string]$AvdName = '',
+    # sdkmanager package id of the emulator system image, for example
+    # system-images;android-36;google_apis;x86_64. Left empty, a host-ABI default is used.
+    [string]$SystemImage = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$script:InstallerVersion = '2.1.0'
 $script:SdkRootOverride = $SdkRoot
 $script:DefaultSdkRoot = 'C:\Android'
 $script:SdkRoot = 'C:\Android'
 # Resolved once, on first use, because an existing SDK elsewhere must not be silently repointed.
 $script:SdkRootResolved = $false
+$script:FlutterRootOverride = $FlutterRoot
 $script:FlutterRoot = 'C:\flutter'
+if ($env:ANDROID_SDK_INSTALLER_FLUTTER_ROOT) { $script:FlutterRoot = $env:ANDROID_SDK_INSTALLER_FLUTTER_ROOT }
+if ($script:FlutterRootOverride) { $script:FlutterRoot = $script:FlutterRootOverride }
+$script:AvdNameOverride = $AvdName
+if ($env:ANDROID_SDK_INSTALLER_AVD_NAME) { $script:AvdNameOverride = $env:ANDROID_SDK_INSTALLER_AVD_NAME }
+$script:SystemImageOverride = $SystemImage
+if ($env:ANDROID_SDK_INSTALLER_SYSTEM_IMAGE) { $script:SystemImageOverride = $env:ANDROID_SDK_INSTALLER_SYSTEM_IMAGE }
 $script:OriginalUserSid = $OriginalUserSid
+# The JDK lookup runs java.exe, so its answer is cached until a JDK is installed mid-session.
+$script:JdkInfoCache = $null
 # True while an inline (single-line, redrawn) progress bar owns the current console line.
 $script:InlineProgressActive = $false
 $script:EnvBroadcastTypeLoaded = $false
@@ -46,12 +63,20 @@ if ([string]::IsNullOrWhiteSpace($script:OriginalUserSid)) { $script:OriginalUse
 $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Requesting Administrator privileges...' -ForegroundColor Yellow
-    $powerShellExe = Join-Path $PSHOME 'powershell.exe'
+    # Windows PowerShell 5.1 is always present on Windows 10/11 and can run this script. Using
+    # $PSHOME alone broke elevation under PowerShell 7, whose folder has no powershell.exe.
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        try { $powerShellExe = (Get-Process -Id $PID -ErrorAction Stop).Path } catch { $powerShellExe = Join-Path $PSHOME 'powershell.exe' }
+    }
     # Everything the caller passed must survive the elevation hop, or a scripted -SdkRoot/-ApiLevel
     # would silently fall back to the defaults in the elevated child.
     $elevationArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -OriginalUserSid `"$script:OriginalUserSid`""
     if ($script:SdkRootOverride) { $elevationArgs += " -SdkRoot `"$($script:SdkRootOverride.Replace('"', ''))`"" }
     if ($ApiLevel -gt 0) { $elevationArgs += " -ApiLevel $ApiLevel" }
+    if ($script:FlutterRootOverride) { $elevationArgs += " -FlutterRoot `"$($script:FlutterRootOverride.Replace('"', ''))`"" }
+    if ($script:AvdNameOverride) { $elevationArgs += " -AvdName `"$($script:AvdNameOverride.Replace('"', ''))`"" }
+    if ($script:SystemImageOverride) { $elevationArgs += " -SystemImage `"$($script:SystemImageOverride.Replace('"', ''))`"" }
     try {
         $elevated = Start-Process -FilePath $powerShellExe -ArgumentList $elevationArgs -Verb RunAs -Wait -PassThru
         exit $elevated.ExitCode
@@ -419,6 +444,8 @@ function Get-InstalledSdkPackagesOnDisk {
         }
     }
     if (Test-Path -LiteralPath (Join-Path $SdkRoot 'platform-tools\adb.exe') -PathType Leaf) { $found += 'platform-tools' }
+    if (Test-Path -LiteralPath (Join-Path $SdkRoot 'emulator\emulator.exe') -PathType Leaf) { $found += 'emulator' }
+    $found += @(Get-SystemImageFolders -SdkRoot $SdkRoot)
     return @($found | Sort-Object -Unique)
 }
 
@@ -808,6 +835,10 @@ function Install-GitFromGitHub {
 }
 
 function Get-JdkInfo {
+    # The lookup starts java.exe for every candidate. The answer is cached for the session and
+    # refreshed after a JDK is installed, so the menu can show the JDK state on every redraw.
+    param([switch]$Refresh)
+    if (-not $Refresh -and ($null -ne $script:JdkInfoCache)) { return $script:JdkInfoCache }
     $candidates = @()
     if ($env:JAVA_HOME) {
         $candidate = Join-Path $env:JAVA_HOME 'bin\java.exe'
@@ -852,13 +883,16 @@ function Get-JdkInfo {
     $suitable = @($found | Where-Object { ($_.Major -ge $script:JdkMinMajor) -and ($_.Major -le $script:JdkMaxMajor) })
     if ($suitable.Count -gt 0) {
         $best = @($suitable | Sort-Object Major | Select-Object -First 1)
-        return [pscustomobject]@{ Ready = $true; JavaHome = $best.JavaHome; Major = $best.Major; NewerMajor = 0; NewerJavaHome = '' }
+        $script:JdkInfoCache = [pscustomobject]@{ Ready = $true; JavaHome = $best.JavaHome; Major = $best.Major; NewerMajor = 0; NewerJavaHome = '' }
+        return $script:JdkInfoCache
     }
     $newer = @($found | Where-Object { $_.Major -gt $script:JdkMaxMajor } | Sort-Object Major | Select-Object -First 1)
     if ($newer.Count -gt 0) {
-        return [pscustomobject]@{ Ready = $false; JavaHome = ''; Major = 0; NewerMajor = $newer[0].Major; NewerJavaHome = $newer[0].JavaHome }
+        $script:JdkInfoCache = [pscustomobject]@{ Ready = $false; JavaHome = ''; Major = 0; NewerMajor = $newer[0].Major; NewerJavaHome = $newer[0].JavaHome }
+        return $script:JdkInfoCache
     }
-    return [pscustomobject]@{ Ready = $false; JavaHome = ''; Major = 0; NewerMajor = 0; NewerJavaHome = '' }
+    $script:JdkInfoCache = [pscustomobject]@{ Ready = $false; JavaHome = ''; Major = 0; NewerMajor = 0; NewerJavaHome = '' }
+    return $script:JdkInfoCache
 }
 
 function Ensure-Jdk {
@@ -890,7 +924,7 @@ function Ensure-Jdk {
         }
         if (-not $installed) { Install-TemurinJdkFromAdoptium }
         Refresh-ProcessPath
-        $jdk = Get-JdkInfo
+        $jdk = Get-JdkInfo -Refresh
         if (-not $jdk.Ready) { throw 'JDK installation finished, but java.exe and javac.exe for JDK 17+ were not found. Reopen the terminal and retry.' }
     }
     [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdk.JavaHome, 'Machine')
@@ -1877,6 +1911,11 @@ function Get-SdkPackageMarkerPath {
     if ($Package -imatch '^platforms;android-(?<api>.+)$') { return (Join-Path $SdkRoot "platforms\android-$($Matches['api'])\android.jar") }
     if ($Package -imatch '^cmdline-tools;latest$') { return (Join-Path $SdkRoot 'cmdline-tools\latest\bin\sdkmanager.bat') }
     if ($Package -imatch '^emulator$') { return (Join-Path $SdkRoot 'emulator\emulator.exe') }
+    if ($Package -imatch '^system-images;(?<image>.+)$') {
+        # system-images;android-36;google_apis;x86_64 maps onto the folder hierarchy under the SDK.
+        $relative = 'system-images\' + ($Matches['image'] -replace ';', '\') + '\system.img'
+        return (Join-Path $SdkRoot $relative)
+    }
     return ''
 }
 
@@ -2054,6 +2093,317 @@ function Get-LatestCmdlineToolsInfo {
     return [pscustomobject]@{ Build = $build; Url = "https://dl.google.com/android/repository/commandlinetools-win_$($build)_latest.zip" }
 }
 
+# ---------------------------------------------------------------------------
+# Android Emulator, system images, and virtual devices
+# The core install never downloads them: option 4 and the full setup do, on request.
+# ---------------------------------------------------------------------------
+
+function Get-EmulatorAbi {
+    # Google publishes every system image for one host ABI, so the ABI follows the CPU that runs
+    # the emulator. Windows on ARM uses arm64-v8a; everything else uses x86_64.
+    param([string]$Architecture = '')
+    if ([string]::IsNullOrWhiteSpace($Architecture)) {
+        # A 32-bit process on 64-bit Windows reports the emulated architecture in
+        # PROCESSOR_ARCHITECTURE and the real one in PROCESSOR_ARCHITEW6432.
+        $Architecture = $env:PROCESSOR_ARCHITECTURE
+        if ($env:PROCESSOR_ARCHITEW6432) { $Architecture = $env:PROCESSOR_ARCHITEW6432 }
+    }
+    if ([string]::IsNullOrWhiteSpace($Architecture)) { return 'x86_64' }
+    if ($Architecture -match '(?i)arm64') { return 'arm64-v8a' }
+    return 'x86_64'
+}
+
+function Get-DefaultSystemImage {
+    param([int]$Api = 0, [string]$Abi = '')
+    if ($Api -le 0) { $Api = $script:ApiLevel }
+    if ([string]::IsNullOrWhiteSpace($Abi)) { $Abi = Get-EmulatorAbi }
+    return "system-images;android-$Api;google_apis;$Abi"
+}
+
+function Test-SystemImagePackage {
+    param([string]$Package)
+    if ([string]::IsNullOrWhiteSpace($Package)) { return $false }
+    return ($Package -match '^system-images;android-\d+;[A-Za-z0-9_.\-]+;[A-Za-z0-9_.\-]+$')
+}
+
+function ConvertTo-AvdName {
+    # AVD names become file names under %USERPROFILE%\.android\avd, so only [A-Za-z0-9._-] survives.
+    param([string]$Name = '', [int]$Api = 0)
+    $clean = ([string]$Name).Trim()
+    $clean = $clean -replace '[^A-Za-z0-9._-]', '_'
+    $clean = $clean -replace '_+', '_'
+    $clean = $clean.Trim('_', '.', '-')
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        if ($Api -gt 0) { return "Pixel_Api$Api" }
+        return 'Pixel_Emulator'
+    }
+    return $clean
+}
+
+function Get-AvdRoot {
+    # AVDs belong to the signed-in user. An elevated session started with another administrator's
+    # credentials must not create the device in that administrator's profile instead.
+    param([string]$ProfilePath = '')
+    if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+        $ProfilePath = Get-OriginalUserProfilePath
+        if ([string]::IsNullOrWhiteSpace($ProfilePath)) { $ProfilePath = $env:USERPROFILE }
+    }
+    if ([string]::IsNullOrWhiteSpace($ProfilePath)) { return '' }
+    return (Join-Path $ProfilePath '.android\avd')
+}
+
+function Get-AvdNames {
+    param([string]$AvdRoot = '')
+    if ([string]::IsNullOrWhiteSpace($AvdRoot)) { $AvdRoot = Get-AvdRoot }
+    if ([string]::IsNullOrWhiteSpace($AvdRoot) -or -not (Test-Path -LiteralPath $AvdRoot -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $AvdRoot -Filter '*.ini' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName } | Sort-Object)
+}
+
+function Get-SystemImageFolders {
+    # Installed system images as sdkmanager package ids, proven by their system.img. A folder that
+    # exists without the image stays unlisted, so a half-finished download is never advertised.
+    param([Parameter(Mandatory = $true)][string]$SdkRoot)
+    $root = Join-Path $SdkRoot 'system-images'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+    $found = @()
+    foreach ($apiDir in (Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($tagDir in (Get-ChildItem -LiteralPath $apiDir.FullName -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($abiDir in (Get-ChildItem -LiteralPath $tagDir.FullName -Directory -ErrorAction SilentlyContinue)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $abiDir.FullName 'system.img') -PathType Leaf)) { continue }
+                $found += ('system-images;' + $apiDir.Name + ';' + $tagDir.Name + ';' + $abiDir.Name)
+            }
+        }
+    }
+    return @($found | Sort-Object -Unique)
+}
+
+function Get-SdkPackageManagerPaths {
+    # One place decides which Android package managers are usable, so no step guesses on its own.
+    param([Parameter(Mandatory = $true)][string]$SdkRoot)
+    $bin = Join-Path $SdkRoot 'cmdline-tools\latest\bin'
+    $sdkManager = Join-Path $bin 'sdkmanager.bat'
+    $androidCli = Join-Path $bin 'android.exe'
+    $avdManager = Join-Path $bin 'avdmanager.bat'
+    $emulator = Join-Path $SdkRoot 'emulator\emulator.exe'
+    return [pscustomobject]@{
+        Bin        = $bin
+        SdkManager = $(if (Test-Path -LiteralPath $sdkManager -PathType Leaf) { $sdkManager } else { '' })
+        AndroidCli = $(if (Test-Path -LiteralPath $androidCli -PathType Leaf) { $androidCli } else { '' })
+        AvdManager = $(if (Test-Path -LiteralPath $avdManager -PathType Leaf) { $avdManager } else { '' })
+        Emulator   = $(if (Test-Path -LiteralPath $emulator -PathType Leaf) { $emulator } else { '' })
+    }
+}
+
+function Request-SdkLicenseConsent {
+    # Option 1, option 4, and the full setup share this prompt, so licenses are always accepted by
+    # one explicit decision and never as a side effect of asking for a package.
+    param(
+        [AllowEmptyString()][string]$SdkManager = '',
+        [AllowEmptyString()][string]$AndroidCli = '',
+        [Parameter(Mandatory = $true)][string]$SdkRoot,
+        [string]$Purpose = 'the Android SDK packages',
+        # The full setup already asked in step 1; a second identical prompt adds nothing.
+        [switch]$ReuseGranted
+    )
+    if ($ReuseGranted -and $script:AcceptAllLicensesGranted -and
+        (Test-Path -LiteralPath (Join-Path $SdkRoot 'licenses\android-sdk-license') -PathType Leaf)) {
+        return $true
+    }
+    $licenseHint = Get-SdkPackageManagerHint -SdkManager $SdkManager -AndroidCli $AndroidCli -SdkRoot $SdkRoot -Arguments '--licenses'
+    Write-Host ''
+    Write-Host '[*] Android SDK packages can only be downloaded after their licenses are accepted.' -ForegroundColor Yellow
+    Write-Host "    This step needs the licenses for: $Purpose" -ForegroundColor Gray
+    $choice = ''
+    if (Test-InteractiveConsoleHost) {
+        $choice = Read-InstallerInput -Prompt 'Accept every Android SDK license now? (Y = accept all, N = answer each prompt yourself)' -Default 'Y' -Choices 'Y|N'
+    } elseif ($env:ANDROID_SDK_INSTALLER_ACCEPT_LICENSES -imatch '^(y|yes|true|1)$') {
+        $choice = 'Y'
+        Write-Host '[*] ANDROID_SDK_INSTALLER_ACCEPT_LICENSES is set, so every license prompt is answered Y for this unattended run.' -ForegroundColor Yellow
+    } else {
+        throw 'No console is attached, so the license prompts cannot be answered. Start the installer from Run.bat, or set ANDROID_SDK_INSTALLER_ACCEPT_LICENSES=Y for an unattended run.'
+    }
+    $mode = 'Auto'
+    if ($choice -imatch '^N') { $mode = 'Review' }
+    # Installs may only auto-answer a late prompt when the user already agreed to accept all.
+    $script:AcceptAllLicensesGranted = ($mode -eq 'Auto')
+    $accepted = Accept-SdkLicenses -SdkManager $SdkManager -AndroidCli $AndroidCli -SdkRoot $SdkRoot -Mode $mode
+    if (-not $accepted) {
+        throw "The Android SDK licenses were not accepted, so nothing was installed. Run $licenseHint, enter Y at each prompt, then try again."
+    }
+    return $true
+}
+
+function New-AndroidAvd {
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemImage,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$AvdManager = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($AvdManager) -or -not (Test-Path -LiteralPath $AvdManager -PathType Leaf)) {
+        throw 'avdmanager.bat was not found under cmdline-tools\latest\bin, so a virtual device cannot be created.'
+    }
+    $avdRoot = Get-AvdRoot
+    if ([string]::IsNullOrWhiteSpace($avdRoot)) { throw 'The signed-in user profile could not be located, so an AVD cannot be created.' }
+    $androidHome = Split-Path -Parent $avdRoot
+    New-Item -ItemType Directory -Path $androidHome -Force | Out-Null
+
+    if (@(Get-AvdNames -AvdRoot $avdRoot) -contains $Name) {
+        Write-Host "    The virtual device $Name already exists and is recreated with the requested image." -ForegroundColor Gray
+    }
+
+    # avdmanager reads these variables. Pointing them at the signed-in user's profile keeps the AVD
+    # visible to the user even when this session runs elevated for a different administrator.
+    $savedUserHome = $env:ANDROID_USER_HOME
+    $savedAvdHome = $env:ANDROID_AVD_HOME
+    $env:ANDROID_USER_HOME = $androidHome
+    $env:ANDROID_AVD_HOME = $avdRoot
+    try {
+        # A Pixel device profile gives the AVD a realistic screen, camera, and RAM default. Older
+        # command-line tools may not list one, in which case avdmanager's own default is used.
+        $deviceId = ''
+        $deviceResult = Invoke-ExternalCapture -Path $AvdManager -ArgumentList @('list', 'device', '-c')
+        foreach ($candidate in @($deviceResult.Output | ForEach-Object { $_.ToString().Trim() })) {
+            if ($candidate -match '^pixel_(\d+|tablet|c)$') { $deviceId = $candidate; break }
+            if (-not $deviceId -and ($candidate -match '^pixel')) { $deviceId = $candidate }
+        }
+        $avdArgs = @('create', 'avd', '-n', $Name, '-k', $SystemImage, '--force')
+        if ($deviceId) { $avdArgs += @('-d', $deviceId) }
+        # "Do you wish to create a custom hardware profile? [no]" must be answered, or an
+        # unattended run would wait for input forever.
+        $answers = @('no', 'no', 'no')
+        if (Test-InteractiveConsoleHost) {
+            $code = Invoke-ExternalInteractive -Path $AvdManager -ArgumentList $avdArgs -Answers $answers
+        } else {
+            $code = (Invoke-ExternalCapture -Path $AvdManager -ArgumentList $avdArgs -Answers $answers).ExitCode
+        }
+        if ($code -ne 0) { throw "avdmanager could not create $Name (exit code $code)." }
+    } finally {
+        $env:ANDROID_USER_HOME = $savedUserHome
+        $env:ANDROID_AVD_HOME = $savedAvdHome
+    }
+
+    $ini = Join-Path $avdRoot "$Name.ini"
+    $folder = Join-Path $avdRoot "$Name.avd"
+    if (-not (Test-Path -LiteralPath $ini -PathType Leaf) -or -not (Test-Path -LiteralPath $folder -PathType Container)) {
+        throw "avdmanager finished, but the AVD files for $Name were not created under $avdRoot."
+    }
+    Grant-OriginalUserModifyAccess $avdRoot
+    return [pscustomobject]@{ Name = $Name; Ini = $ini; Folder = $folder; AvdRoot = $avdRoot }
+}
+
+function Install-Emulator {
+    Write-Host ''
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host '          Android Emulator + Virtual Device               ' -ForegroundColor Cyan
+    Write-Host '=========================================================' -ForegroundColor Cyan
+
+    $null = Resolve-AndroidSdkRoot -Quiet
+    $sdkRoot = $script:SdkRoot
+    Write-Host "[*] Android SDK root: $sdkRoot" -ForegroundColor Cyan
+    $paths = Get-SdkPackageManagerPaths -SdkRoot $sdkRoot
+    if (-not $paths.SdkManager -and -not $paths.AndroidCli) {
+        throw 'The Android command-line tools are not installed yet. Install them with option 1, then choose this option again.'
+    }
+    # sdkmanager and avdmanager are Java programs.
+    Ensure-Jdk
+
+    $image = [string]$script:SystemImageOverride
+    if ([string]::IsNullOrWhiteSpace($image)) { $image = Get-DefaultSystemImage -Api $script:ApiLevel }
+    $image = $image.Trim().Trim([char]'"')
+    if (-not (Test-SystemImagePackage $image)) {
+        throw "The system image package id is not valid: $image. Use the system-images;<android-api>;<tag>;<abi> form, for example system-images;android-$script:ApiLevel;google_apis;x86_64."
+    }
+    $avdName = ConvertTo-AvdName -Name $script:AvdNameOverride -Api $script:ApiLevel
+    $skipAvd = [bool]$env:ANDROID_SDK_INSTALLER_NO_AVD
+
+    Write-Host ''
+    Write-Host "[*] Emulator:      $sdkRoot\emulator" -ForegroundColor Yellow
+    Write-Host "[*] System image:  $image" -ForegroundColor Yellow
+    if ($skipAvd) { Write-Host '[*] Virtual device: skipped (ANDROID_SDK_INSTALLER_NO_AVD is set)' -ForegroundColor Yellow }
+    else { Write-Host "[*] Virtual device: $avdName" -ForegroundColor Yellow }
+    Write-Host '    The Emulator needs hardware virtualization (Hyper-V/WHPX or AEHD) to run fast.' -ForegroundColor Gray
+
+    Assert-DiskSpace -Path $sdkRoot -RequiredBytes 4GB -Label 'the Android Emulator and its system image'
+    $null = Request-SdkLicenseConsent -SdkManager $paths.SdkManager -AndroidCli $paths.AndroidCli -SdkRoot $sdkRoot -Purpose "the Emulator and $image" -ReuseGranted
+
+    Write-Host ''
+    Write-Host '[Step 1/3] Installing the Emulator and the system image' -ForegroundColor Cyan
+    $packages = @('platform-tools', 'emulator', $image)
+    $code = Install-SdkPackages $paths.SdkManager $paths.AndroidCli $sdkRoot $packages -SkipInstalled
+    if ($code -ne 0) {
+        $installHint = Get-SdkPackageManagerHint -SdkManager $paths.SdkManager -AndroidCli $paths.AndroidCli -SdkRoot $sdkRoot
+        throw "The Emulator installation failed (exit code $code). Check the network connection and retry with: $installHint install `"emulator`" `"$image`""
+    }
+
+    Write-Host ''
+    Write-Host '[Step 2/3] Verifying the installed files' -ForegroundColor Cyan
+    $paths = Get-SdkPackageManagerPaths -SdkRoot $sdkRoot
+    $missing = @($packages | Where-Object { -not (Test-SdkPackagePresent -SdkRoot $sdkRoot -Package $_) })
+    if ($missing.Count -gt 0) { throw "The Emulator step finished, but these packages are missing or incomplete on disk: $($missing -join ', ')." }
+    if (-not $paths.Emulator) { throw "emulator.exe was not found under $sdkRoot\emulator after the install." }
+
+    # PATH is a decision, not a side effect. The core installer never adds the Emulator; this
+    # option asks, and an unattended run follows ANDROID_SDK_INSTALLER_EMULATOR_PATH.
+    $emulatorBin = Join-Path $sdkRoot 'emulator'
+    $addToPath = $false
+    if ($env:ANDROID_SDK_INSTALLER_EMULATOR_PATH -imatch '^(y|yes|true|1)$') { $addToPath = $true }
+    elseif ($env:ANDROID_SDK_INSTALLER_EMULATOR_PATH -imatch '^(n|no|false|0)$') { $addToPath = $false }
+    elseif (Test-InteractiveConsoleHost) {
+        $answer = Read-InstallerInput -Prompt "Add $emulatorBin to Machine PATH so 'emulator' works in any terminal? (Y/N)" -Default 'Y' -Choices 'Y|N'
+        $addToPath = ($answer -match '^(?i)y')
+    }
+    if ($addToPath) {
+        Add-PathEntry $emulatorBin 'Machine'
+        Broadcast-EnvironmentChange
+        Write-Host "[+] $emulatorBin added to Machine PATH." -ForegroundColor Green
+    } else {
+        Write-Host "[*] $emulatorBin was left out of PATH. Run the emulator with its full path." -ForegroundColor Gray
+    }
+
+    Write-Host ''
+    Write-Host '[Step 3/3] Creating the virtual device' -ForegroundColor Cyan
+    $avd = $null
+    if ($skipAvd) {
+        Write-Host '    Skipped; ANDROID_SDK_INSTALLER_NO_AVD is set.' -ForegroundColor Gray
+    } else {
+        $avd = New-AndroidAvd -SystemImage $image -Name $avdName -AvdManager $paths.AvdManager
+        Write-Host "[+] Virtual device ready: $($avd.Name)" -ForegroundColor Green
+    }
+
+    # A missing accelerator is a warning, not a failure: the Emulator still installs, and the user
+    # can enable WHPX/AEHD or run on a slower software-rendered device.
+    $accelOutput = @()
+    $accelCode = 0
+    try {
+        $accel = Invoke-ExternalCapture -Path $paths.Emulator -ArgumentList @('-accel-check')
+        $accelCode = $accel.ExitCode
+        $accelOutput = @($accel.Output | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() })
+    } catch { $accelCode = 1 }
+    if ($accelCode -ne 0) {
+        Write-Host ''
+        Write-Warning 'Hardware acceleration for the Emulator is not available yet. Enable Windows Hypervisor Platform (WHPX) or install AEHD, then restart Windows.'
+        foreach ($line in ($accelOutput | Select-Object -First 4)) { Write-Host "    $line" -ForegroundColor DarkGray }
+    }
+
+    Write-Host ''
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host 'ANDROID EMULATOR INSTALLATION VERIFIED' -ForegroundColor Green
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host "Emulator: $($paths.Emulator)"
+    Write-Host "System image: $image"
+    if ($avd) {
+        Write-Host "Virtual device: $($avd.Name)"
+        Write-Host "    $($avd.Folder)"
+        $launch = 'emulator'
+        if (-not $addToPath) { $launch = "`"$($paths.Emulator)`"" }
+        Write-Host "Start it with: $launch -avd $($avd.Name)" -ForegroundColor Yellow
+    } else {
+        Write-Host 'No virtual device was created; create one later in Android Studio or with avdmanager.' -ForegroundColor Gray
+    }
+    if ($accelCode -ne 0) { Write-Host 'Hardware acceleration still needs to be enabled before the device boots quickly.' -ForegroundColor Yellow }
+    Write-Host 'Open a new terminal before using the emulator command.' -ForegroundColor Yellow
+}
+
 function Install-AndroidSdk {
     Write-Host ''
     Write-Host '=========================================================' -ForegroundColor Cyan
@@ -2145,25 +2495,7 @@ function Install-AndroidSdk {
         $licenseHint = Get-SdkPackageManagerHint -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot -Arguments '--licenses'
         $installHint = Get-SdkPackageManagerHint -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot
 
-        Write-Host ''
-        Write-Host '[*] Android SDK packages can only be downloaded after their licenses are accepted.' -ForegroundColor Yellow
-        $licenseChoice = ''
-        if (Test-InteractiveConsoleHost) {
-            $licenseChoice = Read-InstallerInput -Prompt 'Accept every Android SDK license now? (Y = accept all, N = answer each prompt yourself)' -Default 'Y' -Choices 'Y|N'
-        } elseif ($env:ANDROID_SDK_INSTALLER_ACCEPT_LICENSES -imatch '^(y|yes|true|1)$') {
-            $licenseChoice = 'Y'
-            Write-Host '[*] ANDROID_SDK_INSTALLER_ACCEPT_LICENSES is set, so every license prompt is answered Y for this unattended run.' -ForegroundColor Yellow
-        } else {
-            throw 'No console is attached, so the license prompts cannot be answered. Start the installer from Run.bat, or set ANDROID_SDK_INSTALLER_ACCEPT_LICENSES=Y for an unattended run.'
-        }
-        $licenseMode = 'Auto'
-        if ($licenseChoice -imatch '^N') { $licenseMode = 'Review' }
-        # Installs may only auto-answer a late prompt when the user already agreed to accept all.
-        $script:AcceptAllLicensesGranted = ($licenseMode -eq 'Auto')
-        $licensesAccepted = Accept-SdkLicenses -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot -Mode $licenseMode
-        if (-not $licensesAccepted) {
-            throw "The Android SDK licenses were not accepted, so no package can be installed. Run $licenseHint, enter Y at each prompt, then choose option 1 again."
-        }
+        $null = Request-SdkLicenseConsent -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot -Purpose "Android Platform $script:ApiLevel, Build Tools, NDK, and CMake"
 
         $available = @(Get-AvailableSdkPackages -SdkManager $sdkManager -AndroidCli $androidCli -SdkRoot $script:SdkRoot)
         $buildTools = Get-LatestSdkPackage $available 'build-tools' "$script:ApiLevel"
@@ -2285,7 +2617,7 @@ function Install-AndroidSdk {
 function Install-Flutter {
     Write-Host ''
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Write-Host '            Flutter Installation (C:\flutter)            ' -ForegroundColor Cyan
+    Write-Host "            Flutter Installation ($script:FlutterRoot)".PadRight(58) -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
     Ensure-Jdk
     $git = Ensure-GitForWindows
@@ -2373,9 +2705,11 @@ function Install-Flutter {
 
         Add-PathEntry $flutterBin 'Machine'
         Broadcast-EnvironmentChange
+        # The first flutter run downloads the Dart SDK and the engine artifacts into bin\cache.
+        Assert-DiskSpace -Path $script:FlutterRoot -RequiredBytes 2GB -Label 'the Flutter tool, Dart SDK, and engine artifacts'
         Write-Host '[*] Verifying Flutter installation...' -ForegroundColor Yellow
         $versionCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('--version')
-        if ($versionCode -ne 0) { throw "flutter --version failed (exit code $versionCode). Files remain in C:\flutter for troubleshooting." }
+        if ($versionCode -ne 0) { throw "flutter --version failed (exit code $versionCode). Files remain in $script:FlutterRoot for troubleshooting." }
         if (Test-Path -LiteralPath $sdkPlatform -PathType Leaf) {
             Write-Host '[*] Running flutter doctor -v...' -ForegroundColor Yellow
             $doctorCode = Invoke-ExternalInteractive -Path $flutterBat -ArgumentList @('doctor', '-v')
@@ -2616,20 +2950,33 @@ function Show-EnvironmentPathStatus {
         Write-EnvironmentCheckResult 'WARN' "An NDK is installed at $ndkFolder, but ANDROID_NDK_HOME is not set. Run option 1 to refresh the environment."
     }
 
-    # The Emulator folder is no longer added to PATH automatically, so report its real state instead
-    # of leaving a missing PATH entry to look like an installation failure.
+    # The Emulator and its images are optional, so they are reported honestly instead of making a
+    # missing PATH entry look like a broken installation.
     $emulatorRoot = Join-Path $androidRoot 'emulator'
     $emulatorExe = Join-Path $emulatorRoot 'emulator.exe'
     if (Test-Path -LiteralPath $emulatorExe -PathType Leaf) {
+        Write-EnvironmentCheckResult 'OK' "The Android Emulator is installed: $emulatorExe"
         $emulatorScopes = @(Get-PathEntryScopes $emulatorRoot)
         if ($emulatorScopes.Count -gt 0) {
-            Write-Host "[INFO] The Android Emulator is installed and appears in $($emulatorScopes -join ', ') PATH. This installer no longer adds it; remove that entry by hand if you do not want it." -ForegroundColor Gray
+            Write-Host "[INFO] The Emulator folder appears in $($emulatorScopes -join ', ') PATH, so the 'emulator' command works in a new terminal." -ForegroundColor Gray
         } else {
-            Write-Host "[INFO] The Android Emulator is installed at $emulatorRoot but is not on PATH. That is the intended default: Android Studio and Flutter use it through ANDROID_HOME, and only the 'emulator' command line needs the extra PATH entry." -ForegroundColor Gray
+            Write-Host "[INFO] The Emulator is installed but its folder is not on PATH. Android Studio and Flutter reach it through ANDROID_HOME; run option 4 again to add it, or use the full path." -ForegroundColor Gray
         }
     } else {
-        $emulatorInstall = "$managerHint install `"emulator`" `"system-images;android-$script:ApiLevel;google_apis;x86_64`""
-        Write-Host "[INFO] The Android Emulator is not installed under $androidRoot. This installer never downloads it; to add a virtual device run: $emulatorInstall and then create the device with avdmanager or AVD Manager." -ForegroundColor Gray
+        $emulatorInstall = "$managerHint install `"emulator`" `"$(Get-DefaultSystemImage -Api $script:ApiLevel)`""
+        Write-EnvironmentCheckResult 'WARN' "The Android Emulator is not installed. Run option 4 to add it, or install it manually with: $emulatorInstall"
+    }
+    $systemImages = @(Get-SystemImageFolders -SdkRoot $androidRoot)
+    if ($systemImages.Count -gt 0) {
+        Write-EnvironmentCheckResult 'OK' "Emulator system image(s) installed: $($systemImages -join ', ')"
+    } elseif (Test-Path -LiteralPath $emulatorExe -PathType Leaf) {
+        Write-EnvironmentCheckResult 'WARN' 'The Emulator is installed without a system image, so no virtual device can boot. Run option 4 to add one.'
+    }
+    $avdNames = @(Get-AvdNames)
+    if ($avdNames.Count -gt 0) {
+        Write-EnvironmentCheckResult 'OK' "Virtual device(s) available: $($avdNames -join ', ')"
+    } elseif (Test-Path -LiteralPath $emulatorExe -PathType Leaf) {
+        Write-EnvironmentCheckResult 'WARN' 'No virtual device (AVD) exists yet. Run option 4, or create one in Android Studio.'
     }
 
     Write-Host ''
@@ -2654,20 +3001,128 @@ function Show-EnvironmentPathStatus {
     Write-Host 'Machine and User PATH changes may require a newly opened terminal.' -ForegroundColor Gray
 }
 
+function Get-SetupStatus {
+    # Read-only snapshot for the menu. It deliberately does not call Resolve-AndroidSdkRoot: that
+    # would answer option 1's "reuse the SDK that is already configured?" question in advance.
+    param([switch]$IncludeAvd)
+    $parts = @()
+    $jdk = Get-JdkInfo
+    if ($jdk.Ready) { $parts += [pscustomobject]@{ Text = "Java $($jdk.Major) OK"; Color = 'Green' } }
+    elseif ($jdk.NewerMajor -gt 0) { $parts += [pscustomobject]@{ Text = "Java $($jdk.NewerMajor) only"; Color = 'Yellow' } }
+    else { $parts += [pscustomobject]@{ Text = 'Java missing'; Color = 'Red' } }
+
+    $sdkRoot = [Environment]::GetEnvironmentVariable('ANDROID_HOME', 'Machine')
+    if ([string]::IsNullOrWhiteSpace($sdkRoot)) { $sdkRoot = [Environment]::GetEnvironmentVariable('ANDROID_HOME', 'User') }
+    if ([string]::IsNullOrWhiteSpace($sdkRoot)) { $sdkRoot = $script:SdkRoot }
+    $adb = Join-Path $sdkRoot 'platform-tools\adb.exe'
+    $platform = Join-Path $sdkRoot "platforms\android-$script:ApiLevel\android.jar"
+    if (Test-Path -LiteralPath $platform -PathType Leaf) { $parts += [pscustomobject]@{ Text = "SDK $script:ApiLevel OK"; Color = 'Green' } }
+    elseif (Test-Path -LiteralPath $adb -PathType Leaf) { $parts += [pscustomobject]@{ Text = 'SDK partial'; Color = 'Yellow' } }
+    else { $parts += [pscustomobject]@{ Text = 'SDK missing'; Color = 'Red' } }
+
+    if (Test-Path -LiteralPath (Join-Path $script:FlutterRoot 'bin\flutter.bat') -PathType Leaf) {
+        $parts += [pscustomobject]@{ Text = 'Flutter OK'; Color = 'Green' }
+    } else {
+        $parts += [pscustomobject]@{ Text = 'Flutter missing'; Color = 'DarkGray' }
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $sdkRoot 'emulator\emulator.exe') -PathType Leaf) {
+        $parts += [pscustomobject]@{ Text = 'Emulator OK'; Color = 'Green' }
+    } else {
+        $parts += [pscustomobject]@{ Text = 'Emulator missing'; Color = 'DarkGray' }
+    }
+    if ($IncludeAvd) {
+        $avdCount = @(Get-AvdNames).Count
+        if ($avdCount -gt 0) { $parts += [pscustomobject]@{ Text = "$avdCount AVD(s)"; Color = 'Green' } }
+        else { $parts += [pscustomobject]@{ Text = 'No AVD'; Color = 'DarkGray' } }
+    }
+    return $parts
+}
+
+function Write-SetupStatusLine {
+    $parts = @(Get-SetupStatus -IncludeAvd)
+    Write-Host '  Status: ' -NoNewline -ForegroundColor Gray
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        if ($i -gt 0) { Write-Host ' | ' -NoNewline -ForegroundColor DarkGray }
+        Write-Host $parts[$i].Text -NoNewline -ForegroundColor $parts[$i].Color
+    }
+    Write-Host ''
+}
+
+function Install-Everything {
+    # One run for the whole toolchain. Each step is attempted even when an earlier one failed, so a
+    # single problem (a blocked license, a missing network route) does not cost the other tools.
+    Write-Host ''
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host '                 Full Toolchain Setup                    ' -ForegroundColor Cyan
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host 'This runs the Android SDK, Flutter, and Emulator steps in order.' -ForegroundColor Gray
+
+    $steps = @(
+        [pscustomobject]@{ Name = 'Java SDK + Android SDK'; Action = { Install-AndroidSdk } },
+        [pscustomobject]@{ Name = 'Flutter SDK'; Action = { Install-Flutter } },
+        [pscustomobject]@{ Name = 'Android Emulator + AVD'; Action = { Install-Emulator } }
+    )
+    $results = @()
+    $index = 0
+    foreach ($step in $steps) {
+        $index++
+        Write-Host ''
+        Write-Host '---------------------------------------------------------' -ForegroundColor DarkGray
+        Write-Host "  Step $index of $($steps.Count): $($step.Name)" -ForegroundColor Cyan
+        Write-Host '---------------------------------------------------------' -ForegroundColor DarkGray
+        try {
+            & $step.Action
+            $results += [pscustomobject]@{ Name = $step.Name; Ok = $true; Error = '' }
+        } catch {
+            $script:FailureCount++
+            Close-InlineProgressLine
+            $message = $_.Exception.Message
+            Write-Host "[X] $($step.Name) failed: $message" -ForegroundColor Red
+            $results += [pscustomobject]@{ Name = $step.Name; Ok = $false; Error = $message }
+        }
+    }
+
+    Write-Host ''
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    $failed = @($results | Where-Object { -not $_.Ok })
+    if ($failed.Count -eq 0) { Write-Host 'FULL TOOLCHAIN SETUP COMPLETE' -ForegroundColor Green }
+    else { Write-Host "FULL TOOLCHAIN SETUP FINISHED WITH $($failed.Count) FAILED STEP(S)" -ForegroundColor Yellow }
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    foreach ($result in $results) {
+        if ($result.Ok) { Write-Host "  [+] $($result.Name)" -ForegroundColor Green }
+        else { Write-Host "  [X] $($result.Name): $($result.Error)" -ForegroundColor Red }
+    }
+    if ($failed.Count -eq 0) {
+        Write-Host ''
+        Write-Host 'Open a new terminal, then verify the whole toolchain:' -ForegroundColor Yellow
+        Write-Host '  java -version' -ForegroundColor Gray
+        Write-Host '  adb version' -ForegroundColor Gray
+        Write-Host '  flutter doctor -v' -ForegroundColor Gray
+    } elseif ($failed.Count -lt $results.Count) {
+        Write-Host ''
+        Write-Host 'The steps that passed are installed. Re-run the failed step from the menu, then use option 3 to see what is still missing.' -ForegroundColor Yellow
+    }
+}
+
 Clear-StaleInstallerWorkDirs
 # An unattended run selects its step through the environment and then leaves the menu on its own.
 $pendingChoice = [string]$env:ANDROID_SDK_INSTALLER_CHOICE
 while ($true) {
-    Clear-Host
+    try { Clear-Host } catch { }
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Write-Host '       Android SDK & Flutter Installer for Windows       ' -ForegroundColor Cyan
+    Write-Host "     Android SDK & Flutter Installer for Windows  v$($script:InstallerVersion)" -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
     Write-Host ''
     Write-Host "  1. Java SDK + Android SDK Installation (JDK $script:JdkMinMajor & $script:SdkRoot)" -ForegroundColor Yellow
     Write-Host "  2. Flutter Installation ($script:FlutterRoot)" -ForegroundColor Yellow
     Write-Host '  3. Check Environment Paths' -ForegroundColor Yellow
+    Write-Host '  4. Android Emulator + AVD (optional, about 4 GB)' -ForegroundColor Yellow
+    Write-Host '  5. Install everything: 1 + 2 + 4 (recommended)' -ForegroundColor Cyan
     Write-Host ''
     Write-Host '  0. Exit' -ForegroundColor Gray
+    Write-Host ''
+    Write-SetupStatusLine
     if ($script:FailureCount -gt 0) {
         Write-Host ''
         Write-Host "  $script:FailureCount step(s) failed in this session. Option 3 lists what is still missing." -ForegroundColor Yellow
@@ -2675,11 +3130,13 @@ while ($true) {
     Write-Host ''
     $choice = $pendingChoice.Trim()
     $pendingChoice = ''
-    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = Read-InstallerInput -Prompt 'Enter your choice (1, 2, 3, or 0)' -Default '0' -Choices '1|2|3|0' }
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = Read-InstallerInput -Prompt 'Enter your choice (1, 2, 3, 4, 5, or 0)' -Default '0' -Choices '1|2|3|4|5|0' }
     switch ($choice) {
         '1' { try { Install-AndroidSdk } catch { $script:FailureCount++; Close-InlineProgressLine; Write-Host "`nANDROID SDK INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
         '2' { try { Install-Flutter } catch { $script:FailureCount++; Close-InlineProgressLine; Write-Host "`nFLUTTER INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
         '3' { try { Show-EnvironmentPathStatus } catch { $script:FailureCount++; Close-InlineProgressLine; Write-Host "`nENVIRONMENT PATH CHECK FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
+        '4' { try { Install-Emulator } catch { $script:FailureCount++; Close-InlineProgressLine; Write-Host "`nEMULATOR INSTALLATION FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
+        '5' { try { Install-Everything } catch { $script:FailureCount++; Close-InlineProgressLine; Write-Host "`nFULL SETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red }; Wait-ForEnter 'Press Enter to return to the menu...' }
         '0' {
             if ($script:FailureCount -gt 0) {
                 # Run.bat forwards this code, so a scripted run can tell success from a handled failure.
@@ -2688,6 +3145,6 @@ while ($true) {
             }
             exit 0
         }
-        default { Write-Host 'Invalid choice. Enter 1, 2, 3, or 0.' -ForegroundColor Red; Start-Sleep -Seconds 1 }
+        default { Write-Host 'Invalid choice. Enter 1, 2, 3, 4, 5, or 0.' -ForegroundColor Red; Start-Sleep -Seconds 1 }
     }
 }

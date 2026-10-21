@@ -1,0 +1,17 @@
+# Download and work leftovers (the installer cleans these up itself, but keep them out of Git)
+*.part
+*.zip
+*.7z
+
+# Editor and IDE folders
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store
