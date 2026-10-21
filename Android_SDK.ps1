@@ -26,10 +26,13 @@ $script:FlutterRootOverride = $FlutterRoot
 $script:FlutterRoot = 'C:\flutter'
 if ($env:ANDROID_SDK_INSTALLER_FLUTTER_ROOT) { $script:FlutterRoot = $env:ANDROID_SDK_INSTALLER_FLUTTER_ROOT }
 if ($script:FlutterRootOverride) { $script:FlutterRoot = $script:FlutterRootOverride }
-$script:AvdNameOverride = $AvdName
+# Environment variables supply a default; an explicit parameter always wins, as with -SdkRoot.
+$script:AvdNameOverride = ''
 if ($env:ANDROID_SDK_INSTALLER_AVD_NAME) { $script:AvdNameOverride = $env:ANDROID_SDK_INSTALLER_AVD_NAME }
-$script:SystemImageOverride = $SystemImage
+if ($AvdName) { $script:AvdNameOverride = $AvdName }
+$script:SystemImageOverride = ''
 if ($env:ANDROID_SDK_INSTALLER_SYSTEM_IMAGE) { $script:SystemImageOverride = $env:ANDROID_SDK_INSTALLER_SYSTEM_IMAGE }
+if ($SystemImage) { $script:SystemImageOverride = $SystemImage }
 $script:OriginalUserSid = $OriginalUserSid
 # The JDK lookup runs java.exe, so its answer is cached until a JDK is installed mid-session.
 $script:JdkInfoCache = $null
@@ -172,29 +175,41 @@ function Get-InstallerStateRoot {
     return $state
 }
 
+function Test-InstallerFlag {
+    # Every ANDROID_SDK_INSTALLER_* switch is read the same way. A plain truthiness test would treat
+    # NO_CACHE=0 or NO_PROGRESS=false as "on", which is the opposite of what the value says.
+    param([AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return ($Value -imatch '^(y|yes|true|1|on)$')
+}
+
 function Read-InstallerCache {
     # Returns cached text while the entry is younger than $MaxAgeHours, otherwise $null.
     param([Parameter(Mandatory = $true)][string]$Name, [double]$MaxAgeHours = 6)
-    if ($env:ANDROID_SDK_INSTALLER_NO_CACHE) { return $null }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_CACHE) { return $null }
     $path = Join-Path (Get-InstallerStateRoot 'cache') $Name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try {
         if (((Get-Date) - (Get-Item -LiteralPath $path).LastWriteTime).TotalHours -gt $MaxAgeHours) { return $null }
-        return [string](Get-Content -LiteralPath $path -Raw -ErrorAction Stop)
+        $text = [string](Get-Content -LiteralPath $path -Raw -ErrorAction Stop)
+        # Set-Content -Encoding UTF8 writes a BOM on Windows PowerShell 5.1. Left in place it makes
+        # a cached number like "15859902" fail its ^\d+$ check and defeats every text cache.
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        return $text
     } catch { return $null }
 }
 
 function Write-InstallerCache {
     param([Parameter(Mandatory = $true)][string]$Name, [AllowEmptyString()][string]$Content)
-    if ($env:ANDROID_SDK_INSTALLER_NO_CACHE -or [string]::IsNullOrWhiteSpace($Content)) { return }
+    if ((Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_CACHE) -or [string]::IsNullOrWhiteSpace($Content)) { return }
     try { Set-Content -LiteralPath (Join-Path (Get-InstallerStateRoot 'cache') $Name) -Value $Content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
 }
 
 function Test-InteractiveConsoleHost {
     # True only when a real console can both show a prompt and take keystrokes. A piped or ISE host
     # answers nothing, so every prompt needs a documented default instead of an endless re-ask.
-    if ($env:ANDROID_SDK_INSTALLER_ASSUME_INTERACTIVE) { return $true }
-    if ($env:ANDROID_SDK_INSTALLER_ASSUME_NONINTERACTIVE) { return $false }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_ASSUME_INTERACTIVE) { return $true }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_ASSUME_NONINTERACTIVE) { return $false }
     if ($Host.Name -like '*ISE*') { return $false }
     try { if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false } } catch { return $false }
     try {
@@ -615,7 +630,7 @@ function Grant-OriginalUserModifyAccess {
     # Inheritance carries the grant into existing and future children. A full /T pass is only needed
     # after someone replaced child ACLs explicitly, so it stays behind an opt-in switch.
     $icaclsArgs = @($Path, '/grant', $ace, '/C', '/Q')
-    if ($env:ANDROID_SDK_INSTALLER_RECURSIVE_ACL -or $Force) { $icaclsArgs = @($Path, '/grant', $ace, '/T', '/C', '/Q') }
+    if ((Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_RECURSIVE_ACL) -or $Force) { $icaclsArgs = @($Path, '/grant', $ace, '/T', '/C', '/Q') }
     $code = Invoke-ExternalToHost -Path $icacls -ArgumentList $icaclsArgs
     if ($code -ne 0) { Write-Warning "Could not grant modify access to the signed-in user for $Path (icacls exit code $code)." }
 }
@@ -754,15 +769,15 @@ function Install-TemurinJdkFromAdoptium {
         Download-File $url $zip "Eclipse Temurin JDK $($script:JdkMinMajor)" $download.Sha256
         if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The Temurin JDK download is too small to be a valid archive.' }
         New-Item -ItemType Directory -Path $extract -Force | Out-Null
-        Write-Host '[*] Extracting Eclipse Temurin JDK 17...' -ForegroundColor Yellow
-        Expand-ArchiveWithProgress -LiteralPath $zip -DestinationPath $extract -Label 'Eclipse Temurin JDK 17'
+        Write-Host "[*] Extracting Eclipse Temurin JDK $($script:JdkMinMajor)..." -ForegroundColor Yellow
+        Expand-ArchiveWithProgress -LiteralPath $zip -DestinationPath $extract -Label "Eclipse Temurin JDK $($script:JdkMinMajor)"
         $jdkFolder = Find-ExtractedJdkHome $extract
         if (-not $jdkFolder) { throw 'The Temurin archive did not contain a JDK with java.exe and javac.exe.' }
 
         $vendorRoot = Join-Path $env:ProgramFiles 'Eclipse Adoptium'
         New-Item -ItemType Directory -Path $vendorRoot -Force | Out-Null
         $destName = Split-Path -Leaf $jdkFolder
-        if ([string]::IsNullOrWhiteSpace($destName) -or ($destName -ieq 'extract')) { $destName = 'jdk-17-hotspot' }
+        if ([string]::IsNullOrWhiteSpace($destName) -or ($destName -ieq 'extract')) { $destName = "jdk-$($script:JdkMinMajor)-hotspot" }
         $dest = Join-Path $vendorRoot $destName
         if (Test-Path -LiteralPath $dest) { $dest = Join-Path $vendorRoot ($destName + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
         Write-Host "[*] Installing JDK to $dest" -ForegroundColor Yellow
@@ -907,25 +922,29 @@ function Ensure-Jdk {
             Write-Host "A JDK $($script:JdkMinMajor)-$($script:JdkMaxMajor) is required, and none was found, so Eclipse Temurin JDK $($script:JdkMinMajor) will be installed automatically." -ForegroundColor Yellow
         } else {
             Write-Host "A JDK $($script:JdkMinMajor) to $($script:JdkMaxMajor) is required for Android builds." -ForegroundColor Yellow
-            $answer = Read-InstallerInput -Prompt "Install Eclipse Temurin JDK $($script:JdkMinMajor) now? (Y/N)" -Default 'N' -Choices 'Y|N'
-            if ($answer -notmatch '(?i)^y(es)?$') { throw "Install a JDK $($script:JdkMinMajor)-$($script:JdkMaxMajor) and run this installer again, or run it from an interactive console." }
+            # Enter means yes: the JDK is required, and an unattended run answers through
+            # ANDROID_SDK_INSTALLER_INSTALL_JDK instead of failing on an invisible prompt.
+            if ([string]::IsNullOrWhiteSpace($env:ANDROID_SDK_INSTALLER_INSTALL_JDK)) {
+                $consent = (Read-InstallerInput -Prompt "Install Eclipse Temurin JDK $($script:JdkMinMajor) now? (Y/N)" -Default 'Y' -Choices 'Y|N') -match '(?i)^y'
+            } else { $consent = Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_INSTALL_JDK }
+            if (-not $consent) { throw "Install a JDK $($script:JdkMinMajor)-$($script:JdkMaxMajor) and run this installer again, or set ANDROID_SDK_INSTALLER_INSTALL_JDK=1." }
         }
         $installed = $false
         if (Get-WingetPath) {
             try {
-                Install-WingetPackage 'EclipseAdoptium.Temurin.17.JDK' 'Eclipse Temurin JDK 17'
+                Install-WingetPackage "EclipseAdoptium.Temurin.$($script:JdkMinMajor).JDK" "Eclipse Temurin JDK $($script:JdkMinMajor)"
                 $installed = $true
             } catch {
                 Write-Warning $_.Exception.Message
                 Write-Host '[*] Falling back to a direct Adoptium download...' -ForegroundColor Yellow
             }
         } else {
-            Write-Host '[*] winget was not found. Downloading Eclipse Temurin JDK 17 from Adoptium...' -ForegroundColor Yellow
+            Write-Host "[*] winget was not found. Downloading Eclipse Temurin JDK $($script:JdkMinMajor) from Adoptium..." -ForegroundColor Yellow
         }
         if (-not $installed) { Install-TemurinJdkFromAdoptium }
         Refresh-ProcessPath
         $jdk = Get-JdkInfo -Refresh
-        if (-not $jdk.Ready) { throw 'JDK installation finished, but java.exe and javac.exe for JDK 17+ were not found. Reopen the terminal and retry.' }
+        if (-not $jdk.Ready) { throw "JDK installation finished, but java.exe and javac.exe for JDK $($script:JdkMinMajor)+ were not found. Reopen the terminal and retry." }
     }
     [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdk.JavaHome, 'Machine')
     $env:JAVA_HOME = $jdk.JavaHome
@@ -946,8 +965,12 @@ function Ensure-GitForWindows {
     $git = Get-GitPath
     if (-not $git) {
         Write-Host 'Git for Windows is required by Flutter.' -ForegroundColor Yellow
-        $answer = Read-InstallerInput -Prompt 'Install Git for Windows now? (Y/N)' -Default 'N' -Choices 'Y|N'
-        if ($answer -notmatch '(?i)^y(es)?$') { throw 'Install Git for Windows and run the Flutter installer again, or answer Y when the installer runs in a console.' }
+        # Enter accepts, because Flutter cannot run without Git; an unattended run states its answer
+        # through ANDROID_SDK_INSTALLER_INSTALL_GIT instead of being forced to fail.
+        if ([string]::IsNullOrWhiteSpace($env:ANDROID_SDK_INSTALLER_INSTALL_GIT)) {
+            $consent = (Read-InstallerInput -Prompt 'Install Git for Windows now? (Y/N)' -Default 'Y' -Choices 'Y|N') -match '(?i)^y'
+        } else { $consent = Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_INSTALL_GIT }
+        if (-not $consent) { throw 'Git for Windows is required by Flutter. Install it, set ANDROID_SDK_INSTALLER_INSTALL_GIT=1, or answer Y when the installer runs in a console.' }
         $installed = $false
         if (Get-WingetPath) {
             try {
@@ -1042,8 +1065,58 @@ function Select-SourceCandidate {
     }
 }
 
+function ConvertFrom-FlutterReleaseCache {
+    # The cache holds one line: version|url|sha256. Parsing it on its own keeps the reader testable
+    # without a network call and gives one place to reject a malformed or tampered cache entry.
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $line = (@($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($line)) { return $null }
+    $parts = @($line.Trim() -split '\|')
+    if ($parts.Count -lt 2) { return $null }
+    $version = $parts[0].Trim()
+    $url = $parts[1].Trim()
+    $sha = ''
+    if ($parts.Count -ge 3) { $sha = $parts[2].Trim() }
+    if ([string]::IsNullOrWhiteSpace($version) -or ($url -notmatch '^https?://')) { return $null }
+    if ($sha -and ($sha -notmatch '^[0-9a-fA-F]{64}$')) { $sha = '' }
+    return [pscustomobject]@{ Kind = 'Url'; Path = $url; Name = "Flutter $version (stable)"; Size = 0; Sha256 = $sha; Version = $version }
+}
+
+function Get-LatestStableFlutterRelease {
+    # Flutter publishes releases_windows.json with the current stable hash, the archive path, and a
+    # SHA-256 per release, so an automatic download needs no hard-coded version.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $cached = ConvertFrom-FlutterReleaseCache (Read-InstallerCache -Name 'flutter-stable.txt' -MaxAgeHours 6)
+    if ($null -ne $cached) {
+        Write-Host "    Latest stable Flutter reused from the installer cache: $($cached.Version)" -ForegroundColor DarkGray
+        return $cached
+    }
+    Write-Host '[*] Looking up the latest stable Flutter release...' -ForegroundColor Yellow
+    try {
+        $index = Invoke-RestMethod -Uri 'https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json' -Headers @{ 'User-Agent' = 'Android-SDK-Installer' } -ErrorAction Stop
+    } catch {
+        Write-Warning "The Flutter release list could not be read: $($_.Exception.Message)"
+        return $null
+    }
+    $stableReleases = @($index.releases | Where-Object { ($_.channel -eq 'stable') -and ($_.archive -match 'windows') })
+    if ($stableReleases.Count -eq 0) { return $null }
+    $stableHash = [string]$index.current_release.stable
+    $selected = $stableReleases | Where-Object { ([string]$_.hash) -eq $stableHash } | Select-Object -First 1
+    if ($null -eq $selected) { $selected = $stableReleases | Select-Object -First 1 }
+    $base = [string]$index.base_url
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'https://storage.googleapis.com/flutter_infra_release/releases' }
+    $url = $base.TrimEnd('/') + '/' + ([string]$selected.archive).TrimStart('/')
+    $record = ConvertFrom-FlutterReleaseCache ("$([string]$selected.version)|$url|$([string]$selected.sha256)")
+    if ($null -eq $record) { return $null }
+    Write-InstallerCache -Name 'flutter-stable.txt' -Content ("$($record.Version)|$($record.Path)|$($record.Sha256)")
+    Write-Host "    Latest stable Flutter: $($record.Version)" -ForegroundColor Gray
+    return $record
+}
+
 function Read-FlutterSource {
     # An unattended run cannot answer "paste a path", so the source can come from the environment.
+    param([switch]$OfferDownload)
     $override = [string]$env:ANDROID_SDK_INSTALLER_FLUTTER_SOURCE
     if (-not [string]::IsNullOrWhiteSpace($override)) {
         $value = $override.Trim().Trim([char]'"').Trim()
@@ -1060,8 +1133,22 @@ function Read-FlutterSource {
         }
         throw "ANDROID_SDK_INSTALLER_FLUTTER_SOURCE is neither a URL, a ZIP file, nor a folder: $value"
     }
+    # A fresh install otherwise needs the user to find a Flutter ZIP first. Offer the official
+    # stable archive instead, with the published SHA-256, and keep the local options one answer away.
+    if ($OfferDownload) {
+        $download = ''
+        if ($env:ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD -match '^(y|yes|true|1)$') { $download = 'Y' }
+        elseif ([string]::IsNullOrWhiteSpace($env:ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD) -and (Test-InteractiveConsoleHost)) {
+            $download = Read-InstallerInput -Prompt 'Download the latest stable Flutter automatically? (Y = download, N = choose a ZIP/folder/URL)' -Default 'Y' -Choices 'Y|N'
+        }
+        if ($download -match '^(?i)y') {
+            $release = Get-LatestStableFlutterRelease
+            if ($null -ne $release) { return $release }
+            Write-Warning 'The automatic Flutter download is not available; choose a local ZIP, folder, or URL instead.'
+        }
+    }
     if (-not (Test-InteractiveConsoleHost)) {
-        throw 'Flutter has to be told where its SDK comes from, and no console is attached. Run the installer from Run.bat, or set ANDROID_SDK_INSTALLER_FLUTTER_SOURCE to a ZIP path, a folder, or a URL.'
+        throw 'Flutter has to be told where its SDK comes from, and no console is attached. Run the installer from Run.bat, set ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD=1 to fetch the latest stable build, or set ANDROID_SDK_INSTALLER_FLUTTER_SOURCE to a ZIP path, a folder, or a URL.'
     }
     while ($true) {
         Write-Host 'Paste a folder containing flutter*.zip, an extracted Flutter folder, a ZIP path, or a direct URL.' -ForegroundColor Yellow
@@ -1098,7 +1185,7 @@ function Read-FlutterSource {
 # ---------------------------------------------------------------------------
 
 function Test-InlineProgressSupported {
-    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return $false }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return $false }
     if ($Host.Name -like '*ISE*') { return $false }
     try { if ([Console]::IsOutputRedirected) { return $false } } catch { return $false }
     try {
@@ -1147,7 +1234,7 @@ function Show-TransferProgress {
         [string]$Counter = '',
         [switch]$Completed
     )
-    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_PROGRESS) { return }
     if ($TotalBytes -lt 0) { $TotalBytes = 0 }
     if ($ReceivedBytes -lt 0) { $ReceivedBytes = 0 }
     if ($BytesPerSecond -lt 0) { $BytesPerSecond = 0 }
@@ -1571,7 +1658,7 @@ function Copy-TreeWithProgress {
     $totalBytes = [double]($files | Measure-Object -Property Length -Sum).Sum
 
     $activity = "Copying $Label"
-    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
         foreach ($file in $files) { Copy-SingleFile -File $file -Target ($destinationRoot + $file.FullName.Substring($sourceRoot.Length)) }
         return
     }
@@ -1614,7 +1701,7 @@ function Copy-FileWithProgress {
     )
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "The source file was not found: $Source" }
     if ([string]::IsNullOrWhiteSpace($Label)) { $Label = [IO.Path]::GetFileName($Source) }
-    if ($env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_PROGRESS) {
         Copy-Item -LiteralPath $Source -Destination $Destination -Force
         return
     }
@@ -1835,7 +1922,7 @@ function Get-SdkPackageNamesFromText {
 
 function Clear-SdkCatalogCache {
     param([string]$SdkRoot)
-    if ($env:ANDROID_SDK_INSTALLER_NO_CACHE) { return }
+    if (Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_CACHE) { return }
     $path = Join-Path (Get-InstallerStateRoot 'cache') ('sdk-catalog-' + (Get-ShortHash $SdkRoot) + '.txt')
     if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
 }
@@ -2103,13 +2190,13 @@ function Get-EmulatorAbi {
     # the emulator. Windows on ARM uses arm64-v8a; everything else uses x86_64.
     param([string]$Architecture = '')
     if ([string]::IsNullOrWhiteSpace($Architecture)) {
-        # A 32-bit process on 64-bit Windows reports the emulated architecture in
-        # PROCESSOR_ARCHITECTURE and the real one in PROCESSOR_ARCHITEW6432.
-        $Architecture = $env:PROCESSOR_ARCHITECTURE
-        if ($env:PROCESSOR_ARCHITEW6432) { $Architecture = $env:PROCESSOR_ARCHITEW6432 }
+        # PROCESSOR_ARCHITECTURE describes the process, not always the machine: a 32-bit process
+        # on 64-bit Windows moves the real value to PROCESSOR_ARCHITEW6432, and an x64 PowerShell
+        # emulated on Windows on ARM still reports AMD64. PROCESSOR_IDENTIFIER names the CPU
+        # ("ARMv8 ..."), so all three are consulted.
+        $Architecture = "$env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_ARCHITEW6432 $env:PROCESSOR_IDENTIFIER"
     }
-    if ([string]::IsNullOrWhiteSpace($Architecture)) { return 'x86_64' }
-    if ($Architecture -match '(?i)arm64') { return 'arm64-v8a' }
+    if ($Architecture -match '(?i)arm') { return 'arm64-v8a' }
     return 'x86_64'
 }
 
@@ -2255,8 +2342,12 @@ function New-AndroidAvd {
     # visible to the user even when this session runs elevated for a different administrator.
     $savedUserHome = $env:ANDROID_USER_HOME
     $savedAvdHome = $env:ANDROID_AVD_HOME
+    $savedSdkHome = $env:ANDROID_SDK_HOME
     $env:ANDROID_USER_HOME = $androidHome
     $env:ANDROID_AVD_HOME = $avdRoot
+    # Older command-line tools read the deprecated ANDROID_SDK_HOME (the folder that contains
+    # .android) instead of ANDROID_USER_HOME.
+    $env:ANDROID_SDK_HOME = (Split-Path -Parent $androidHome)
     try {
         # A Pixel device profile gives the AVD a realistic screen, camera, and RAM default. Older
         # command-line tools may not list one, in which case avdmanager's own default is used.
@@ -2280,6 +2371,7 @@ function New-AndroidAvd {
     } finally {
         $env:ANDROID_USER_HOME = $savedUserHome
         $env:ANDROID_AVD_HOME = $savedAvdHome
+        $env:ANDROID_SDK_HOME = $savedSdkHome
     }
 
     $ini = Join-Path $avdRoot "$Name.ini"
@@ -2314,7 +2406,7 @@ function Install-Emulator {
         throw "The system image package id is not valid: $image. Use the system-images;<android-api>;<tag>;<abi> form, for example system-images;android-$script:ApiLevel;google_apis;x86_64."
     }
     $avdName = ConvertTo-AvdName -Name $script:AvdNameOverride -Api $script:ApiLevel
-    $skipAvd = [bool]$env:ANDROID_SDK_INSTALLER_NO_AVD
+    $skipAvd = Test-InstallerFlag $env:ANDROID_SDK_INSTALLER_NO_AVD
 
     Write-Host ''
     Write-Host "[*] Emulator:      $sdkRoot\emulator" -ForegroundColor Yellow
@@ -2530,8 +2622,8 @@ function Install-AndroidSdk {
         # Persist PATH now that the core packages are installed, so a later verification failure
         # cannot leave platform-tools (adb) missing from Machine PATH. Step 4 repeats this (idempotent).
         Set-AndroidEnvironment
-        # The catalog was read before these packages landed, so drop the cache and let the optional
-        # packages be resolved against the repository state that now includes them.
+        # Recorded packages are cached on disk by another step, so drop that entry now that the core
+        # packages landed; the in-memory list below is still the remote catalog read above.
         Clear-SdkCatalogCache $script:SdkRoot
 
         $native = @()
@@ -2617,11 +2709,11 @@ function Install-AndroidSdk {
 function Install-Flutter {
     Write-Host ''
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Write-Host "            Flutter Installation ($script:FlutterRoot)".PadRight(58) -ForegroundColor Cyan
+    Write-Host ("            Flutter Installation ($script:FlutterRoot)").PadRight(57) -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
     Ensure-Jdk
     $git = Ensure-GitForWindows
-    $source = Read-FlutterSource
+    $source = Read-FlutterSource -OfferDownload
     if ($null -eq $source) { Write-Host 'Cancelled.' -ForegroundColor Yellow; return }
 
     $work = Join-Path $env:TEMP ('FlutterInstaller-' + [guid]::NewGuid().ToString('N'))
@@ -2629,13 +2721,16 @@ function Install-Flutter {
     $extract = Join-Path $work 'extract'
     $stage = Join-Path $work 'flutter-staged'
     $backup = ''
-    Assert-DiskSpace -Path $script:FlutterRoot -RequiredBytes 3GB -Label 'the Flutter SDK installation'
-    if ($source.Kind -ne 'Folder') { Assert-DiskSpace -Path $env:TEMP -RequiredBytes 2GB -Label 'the Flutter download and extraction' }
+    Assert-DiskSpace -Path $script:FlutterRoot -RequiredBytes 4GB -Label 'the Flutter SDK installation'
+    if ($source.Kind -ne 'Folder') { Assert-DiskSpace -Path $env:TEMP -RequiredBytes 4GB -Label 'the Flutter download and extraction' }
     try {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         if ($source.Kind -eq 'Url') {
             Write-Host '[*] Downloading Flutter to a temporary folder...' -ForegroundColor Yellow
-            Download-File $source.Path $zip 'Flutter SDK'
+            $expectedSha = ''
+            if ($source.PSObject.Properties['Sha256']) { $expectedSha = [string]$source.Sha256 }
+            # Positional: Url, Destination, Label, ExpectedSha256.
+            Download-File $source.Path $zip 'Flutter SDK' $expectedSha
         } elseif ($source.Kind -eq 'Zip') {
             Write-Host '[*] Copying the ZIP to a temporary folder. The source file will not be deleted.' -ForegroundColor Yellow
             Copy-FileWithProgress -Source $source.Path -Destination $zip -Label $source.Name

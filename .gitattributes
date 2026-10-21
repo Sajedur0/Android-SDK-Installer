@@ -1,2 +1,7 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
+*.ps1 text eol=lf
+*.psd1 text eol=lf
+*.psm1 text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

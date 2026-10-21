@@ -49,7 +49,8 @@ $wanted = @(
     'Test-SdkPackageInstalled', 'Get-SdkPackageNamesFromText', 'Get-LatestSdkPackage', 'Get-LatestVersionFolder',
     'Test-CmdlineToolsDirectory', 'Test-AndroidSdkRoot', 'Get-SdkPackageManagerHint',
     'Get-EmulatorAbi', 'Get-DefaultSystemImage', 'Test-SystemImagePackage', 'ConvertTo-AvdName',
-    'Get-AvdRoot', 'Get-AvdNames', 'Get-SystemImageFolders', 'Get-SdkPackageManagerPaths'
+    'Get-AvdRoot', 'Get-AvdNames', 'Get-SystemImageFolders', 'Get-SdkPackageManagerPaths',
+    'ConvertFrom-FlutterReleaseCache', 'Test-InstallerFlag'
 )
 $definitions = $ast.FindAll({
         param($node)
@@ -501,6 +502,33 @@ Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_SYSTEM_IMAGE') 'The syste
 Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_EMULATOR_PATH') 'The Emulator PATH entry is opt-in'
 Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_NO_AVD') 'AVD creation can be skipped'
 Assert-True ($scriptText -match "WindowsPowerShell\\v1\.0\\powershell\.exe") 'Elevation uses the Windows PowerShell 5.1 host'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD') 'The automatic Flutter download can be enabled unattended'
+
+# --- 17. The automatic Flutter release lookup --------------------------------
+Write-Host "`n[17] Flutter release cache" -ForegroundColor Yellow
+$flutterSha = 'c2c875da25a1a1448d18ee4e8f398b2f6fce888b4775d8f9130538e16d826cb4'
+$flutterUrl = 'https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_3.47.7-stable.zip'
+$release = ConvertFrom-FlutterReleaseCache "3.47.7|$flutterUrl|$flutterSha"
+Assert-Equal '3.47.7' $release.Version 'The cached Flutter version is read back'
+Assert-Equal 'Url' $release.Kind 'The automatic release is treated as a download'
+Assert-Equal $flutterUrl $release.Path 'The cached Flutter archive URL is read back'
+Assert-Equal $flutterSha $release.Sha256 'The published SHA-256 is read back'
+Assert-True ($release.Name -match '3\.47\.7') 'The release label carries the version'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache '')) 'An empty cache entry is ignored'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache 'not a release')) 'A malformed cache entry is ignored'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache "3.47.7|ftp://example.com/flutter.zip|$flutterSha")) 'A non-HTTP archive URL is rejected'
+$releaseWithoutSha = ConvertFrom-FlutterReleaseCache "3.47.7|$flutterUrl|"
+Assert-Equal '' $releaseWithoutSha.Sha256 'A missing hash leaves verification off, not broken'
+Assert-Equal $flutterUrl $releaseWithoutSha.Path 'The URL without a hash still parses'
+
+# --- 18. Environment switches ------------------------------------------------
+Write-Host "`n[18] Environment switches" -ForegroundColor Yellow
+foreach ($value in @('1', 'Y', 'yes', 'TRUE', 'on')) {
+    Assert-True (Test-InstallerFlag $value) "Switch value [$value] is on"
+}
+foreach ($value in @('', '0', 'N', 'no', 'false', 'off', 'maybe')) {
+    Assert-True (-not (Test-InstallerFlag $value)) "Switch value [$value] is off"
+}
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
