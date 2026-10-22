@@ -116,6 +116,47 @@ function Invoke-ExternalToHost {
     }
 }
 
+function Format-ProcessArgument {
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+    # Leave plain paths, flags, and slash/colon tokens bare; quote spaces, quotes, and cmd.exe
+    # batch parameter delimiters (; = , & | < > ( ) ^ % !) so every argument arrives intact.
+    if ($Value -match '^[A-Za-z0-9_.\-:\\/]+$') { return $Value }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    for ($i = 0; $i -lt $Value.Length; $i++) {
+        $ch = $Value[$i]
+        if ($ch -eq [char]'\') {
+            $backslashes++
+        } elseif ($ch -eq [char]'"') {
+            [void]$builder.Append(([string][char]'\') * ($backslashes * 2 + 1))
+            [void]$builder.Append('"')
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) {
+                [void]$builder.Append(([string][char]'\') * $backslashes)
+                $backslashes = 0
+            }
+            [void]$builder.Append($ch)
+        }
+    }
+    if ($backslashes -gt 0) {
+        [void]$builder.Append(([string][char]'\') * ($backslashes * 2))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Complete-ConsoleLineAfterNative {
+    # Native tools such as android.exe redraw progress bars with "\r" and can exit without writing
+    # a final newline, which would leave the next Write-Host starting mid-line on top of the bar.
+    if (-not (Test-InlineProgressSupported)) { return }
+    try {
+        if ($Host.UI.RawUI.CursorPosition.X -gt 0) { Write-Host '' }
+    } catch { }
+}
+
 function Invoke-ExternalInteractive {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -125,13 +166,56 @@ function Invoke-ExternalInteractive {
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        # Nothing is redirected here: the tool keeps the console, so prompts render as they are
-        # written, progress bars redraw in place, and keystrokes reach the tool. Piping the output
-        # through PowerShell hides prompts that do not end in a newline, which silently turns every
-        # "Accept? (y/N)" answer into the default "no".
-        if ($Answers.Count -gt 0) { $Answers | & $Path @ArgumentList } else { & $Path @ArgumentList }
-        $code = $LASTEXITCODE
-        return $code
+        # Start the child directly with RedirectStandardOutput = $false and RedirectStandardError = $false
+        # instead of invoking "& $Path" inside a function whose return value is assigned ("$code = ...").
+        # A captured function pipeline redirects native stdout into the return value, which both hides
+        # live progress bars/prompts while the tool runs and turns "$code" into "@(<stdout>, <exit>)".
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError = $false
+        $psi.RedirectStandardInput = ($Answers.Count -gt 0)
+
+        $formattedArgs = @($ArgumentList | ForEach-Object { Format-ProcessArgument $_ }) -join ' '
+        if ([IO.Path]::GetExtension($Path) -imatch '^\.(bat|cmd)$') {
+            $psi.FileName = if ($env:ComSpec) { $env:ComSpec } else { 'cmd.exe' }
+            $commandLine = Format-ProcessArgument $Path
+            if ($formattedArgs) { $commandLine += ' ' + $formattedArgs }
+            $psi.Arguments = '/d /s /c "' + $commandLine + '"'
+        } else {
+            $psi.FileName = $Path
+            $psi.Arguments = $formattedArgs
+        }
+
+        $process = [Diagnostics.Process]::Start($psi)
+        if ($null -eq $process) { throw "Process could not be started: $Path" }
+        try {
+            if ($Answers.Count -gt 0) {
+                $payloadText = ($Answers -join [Environment]::NewLine) + [Environment]::NewLine
+                $payload = [Text.Encoding]::ASCII.GetBytes($payloadText)
+                $writeTask = $null
+                try {
+                    $baseStream = $process.StandardInput.BaseStream
+                    $writeTask = $baseStream.WriteAsync($payload, 0, $payload.Length)
+                } catch { }
+                while (-not $process.WaitForExit(100)) {
+                    if (($null -ne $writeTask) -and $writeTask.IsCompleted) {
+                        try { $process.StandardInput.Close() } catch { }
+                        $writeTask = $null
+                    }
+                }
+                try { $process.StandardInput.Close() } catch { }
+                $process.WaitForExit()
+            } else {
+                $process.WaitForExit()
+            }
+            $code = [int]$process.ExitCode
+        } finally {
+            $process.Dispose()
+        }
+        Complete-ConsoleLineAfterNative
+        $global:LASTEXITCODE = $code
+        return [int]$code
     } finally {
         $ErrorActionPreference = $savedPreference
     }
@@ -730,18 +814,21 @@ function Find-ExtractedJdkHome {
 }
 
 function Get-TemurinJdkDownloadInfo {
-    # The assets API publishes the SHA-256 next to the link; the plain binary redirect does not, so
-    # it is only used when that lookup fails.
+    # The assets API publishes the SHA-256 and exact byte size next to the link; the plain binary
+    # redirect does not, so it is only used when that lookup fails.
     param([string]$AdoptiumArch)
     $feature = $script:JdkMinMajor
-    $result = [pscustomobject]@{ Url = ''; Sha256 = '' }
+    $result = [pscustomobject]@{ Url = ''; Sha256 = ''; Size = [double]0 }
     try {
         $api = "https://api.adoptium.net/v3/assets/latest/$feature/hotspot?architecture=$AdoptiumArch&image_type=jdk&os=windows&vendor=eclipse"
         $releases = @(Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'Android-SDK-Installer' } -ErrorAction Stop)
         foreach ($entry in $releases) {
             $binary = $entry.binary
             if (-not $binary -or -not $binary.link) { continue }
-            if ($binary.package -and $binary.package.checksum) { $result.Sha256 = [string]$binary.package.checksum }
+            if ($binary.package) {
+                if ($binary.package.checksum) { $result.Sha256 = [string]$binary.package.checksum }
+                if ($binary.package.size -gt 0) { $result.Size = [double]$binary.package.size }
+            }
             $result.Url = [string]$binary.link
             return $result
         }
@@ -766,7 +853,7 @@ function Install-TemurinJdkFromAdoptium {
         Assert-DiskSpace -Path $env:TEMP -RequiredBytes 2GB -Label 'the Eclipse Temurin JDK download and extraction'
         Assert-DiskSpace -Path $env:ProgramFiles -RequiredBytes 1GB -Label 'the Eclipse Temurin JDK installation'
         Write-Host "[*] Downloading Eclipse Temurin JDK $($script:JdkMinMajor) ($adoptiumArch) from Adoptium..." -ForegroundColor Yellow
-        Download-File $url $zip "Eclipse Temurin JDK $($script:JdkMinMajor)" $download.Sha256
+        Download-File $url $zip "Eclipse Temurin JDK $($script:JdkMinMajor)" -ExpectedSha256 $download.Sha256 -ExpectedBytes $download.Size
         if ((Get-Item -LiteralPath $zip).Length -lt 1048576) { throw 'The Temurin JDK download is too small to be a valid archive.' }
         New-Item -ItemType Directory -Path $extract -Force | Out-Null
         Write-Host "[*] Extracting Eclipse Temurin JDK $($script:JdkMinMajor)..." -ForegroundColor Yellow
@@ -799,7 +886,7 @@ function Get-GitInstallerAsset {
     }
     $fallback = $pinned.x64
     if ($Arch -eq 'arm64') { $fallback = $pinned.arm64 }
-    $result = [pscustomobject]@{ Name = [string]$fallback.Name; Url = [string]$fallback.Url; Sha256 = ''; Source = 'pinned release' }
+    $result = [pscustomobject]@{ Name = [string]$fallback.Name; Url = [string]$fallback.Url; Sha256 = ''; Size = [double]0; Source = 'pinned release' }
     try {
         $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{ 'User-Agent' = 'Android-SDK-Installer' } -ErrorAction Stop
         foreach ($item in @($release.assets)) {
@@ -811,6 +898,7 @@ function Get-GitInstallerAsset {
             $result.Name = $name
             $result.Url = [string]$item.browser_download_url
             if ($item.digest) { $result.Sha256 = ([string]$item.digest).Replace('sha256:', '') }
+            if ($item.size -gt 0) { $result.Size = [double]$item.size }
             $result.Source = 'GitHub release API'
             return $result
         }
@@ -834,7 +922,7 @@ function Install-GitFromGitHub {
         New-Item -ItemType Directory -Path $work -Force | Out-Null
         Assert-DiskSpace -Path $env:TEMP -RequiredBytes 500MB -Label 'the Git for Windows installer download'
         Write-Host "[*] Downloading $($asset.Name)..." -ForegroundColor Yellow
-        Download-File $asset.Url $setup $asset.Name $asset.Sha256
+        Download-File $asset.Url $setup $asset.Name -ExpectedSha256 $asset.Sha256 -ExpectedBytes $asset.Size
         if ((Get-Item -LiteralPath $setup).Length -lt 1048576) { throw 'The Git installer download is too small to be valid.' }
         Write-Host '[*] Installing Git for Windows...' -ForegroundColor Yellow
         $setupArgs = '/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /COMPONENTS=gitlfs,assoc,assoc_sh /o:PathOption=Cmd'
@@ -1066,8 +1154,8 @@ function Select-SourceCandidate {
 }
 
 function ConvertFrom-FlutterReleaseCache {
-    # The cache holds one line: version|url|sha256. Parsing it on its own keeps the reader testable
-    # without a network call and gives one place to reject a malformed or tampered cache entry.
+    # The cache holds one line: version|url|sha256[|size]. Parsing it on its own keeps the reader
+    # testable without a network call and gives one place to reject a malformed cache entry.
     param([AllowEmptyString()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $line = (@($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 1)
@@ -1078,9 +1166,16 @@ function ConvertFrom-FlutterReleaseCache {
     $url = $parts[1].Trim()
     $sha = ''
     if ($parts.Count -ge 3) { $sha = $parts[2].Trim() }
+    $size = [double]0
+    if ($parts.Count -ge 4) {
+        $parsedSize = [double]0
+        if ([double]::TryParse($parts[3].Trim(), [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedSize) -and ($parsedSize -gt 0)) {
+            $size = $parsedSize
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($version) -or ($url -notmatch '^https?://')) { return $null }
     if ($sha -and ($sha -notmatch '^[0-9a-fA-F]{64}$')) { $sha = '' }
-    return [pscustomobject]@{ Kind = 'Url'; Path = $url; Name = "Flutter $version (stable)"; Size = 0; Sha256 = $sha; Version = $version }
+    return [pscustomobject]@{ Kind = 'Url'; Path = $url; Name = "Flutter $version (stable)"; Size = $size; Sha256 = $sha; Version = $version }
 }
 
 function Get-LatestStableFlutterRelease {
@@ -1223,6 +1318,29 @@ function Format-DurationClock {
     return ('{0:00}:{1:00}' -f [int][Math]::Floor($span.TotalMinutes), $span.Seconds)
 }
 
+function Get-TransferPercent {
+    # Exact base-10 percentage to two decimal places. Truncating to completed hundredths (0.01%)
+    # avoids IEEE-754 binary float drift (where 29/100 * 100 reads as 28.999999999999996 -> 28.99%)
+    # and keeps an in-flight download at <= 99.99% until the stream has truly closed and flushed.
+    param(
+        [double]$ReceivedBytes,
+        [double]$TotalBytes,
+        [switch]$Completed
+    )
+    if ($Completed) { return [decimal]100 }
+    if (($TotalBytes -le 0) -or [double]::IsNaN($TotalBytes) -or [double]::IsInfinity($TotalBytes)) { return [decimal]-1 }
+    if (($ReceivedBytes -le 0) -or [double]::IsNaN($ReceivedBytes) -or [double]::IsInfinity($ReceivedBytes)) { return [decimal]0 }
+    if ($ReceivedBytes -ge $TotalBytes) { return [decimal]99.99 }
+    try {
+        $basisPoints = [Math]::Floor(([decimal]$ReceivedBytes * [decimal]10000) / [decimal]$TotalBytes)
+    } catch {
+        $basisPoints = [decimal][Math]::Floor(($ReceivedBytes / $TotalBytes) * 10000.0)
+    }
+    if ($basisPoints -gt 9999) { $basisPoints = [decimal]9999 }
+    if ($basisPoints -lt 0) { $basisPoints = [decimal]0 }
+    return ($basisPoints / [decimal]100)
+}
+
 function Show-TransferProgress {
     param(
         [Parameter(Mandatory = $true)][string]$Activity,
@@ -1240,11 +1358,11 @@ function Show-TransferProgress {
     if ($BytesPerSecond -lt 0) { $BytesPerSecond = 0 }
     if ($ElapsedSeconds -lt 0) { $ElapsedSeconds = 0 }
     $known = $TotalBytes -gt 0
-    $fraction = if ($known) { [Math]::Min(1, $ReceivedBytes / $TotalBytes) } else { -1 }
-    if ($Completed) { $fraction = 1 }
+    $percentValue = Get-TransferPercent -ReceivedBytes $ReceivedBytes -TotalBytes $TotalBytes -Completed:$Completed
+    $fraction = if ($Completed) { [double]1 } elseif ($known) { [Math]::Min(1, $ReceivedBytes / $TotalBytes) } else { [double]-1 }
 
     $inv = [Globalization.CultureInfo]::InvariantCulture
-    $percentText = if ($fraction -ge 0) { ($fraction * 100).ToString('0.0', $inv) + '%' } else { '?' }
+    $percentText = if ($percentValue -ge 0) { $percentValue.ToString('0.00', $inv) + '%' } else { '?' }
     $receivedText = Format-ByteSize $ReceivedBytes
     $totalText = if ($known) { Format-ByteSize $TotalBytes } else { 'unknown' }
     $speedText = (Format-ByteSize $BytesPerSecond) + '/s'
@@ -1255,14 +1373,14 @@ function Show-TransferProgress {
     # does not jitter while it is redrawn in place.
     $width = Get-ProgressLineWidth
     if ($width -lt 76) {
-        $detail = ('{0,5} {1,9}/{2,9} {3,9} {4,7}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+        $detail = ('{0,7} {1,9}/{2,9} {3,9} {4,7}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
     } elseif ($width -lt 112) {
-        $detail = ('{0,5}  {1,9} / {2,-10} {3,10}  {4,7} left' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+        $detail = ('{0,7}  {1,9} / {2,-10} {3,10}  {4,7} left' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
     } elseif ($Counter) {
         # The file/item counter is more useful than the elapsed clock on busy steps.
-        $detail = ('{0,6}  {1,10} / {2,-10}  {3,10}  left {4}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
+        $detail = ('{0,7}  {1,10} / {2,-10}  {3,10}  left {4}' -f $percentText, $receivedText, $totalText, $speedText, $leftText)
     } else {
-        $detail = ('{0,6}  {1,10} / {2,-10}  {3,10}  elapsed {4}  left {5}' -f $percentText, $receivedText, $totalText, $speedText, $elapsedText, $leftText)
+        $detail = ('{0,7}  {1,10} / {2,-10}  {3,10}  elapsed {4}  left {5}' -f $percentText, $receivedText, $totalText, $speedText, $elapsedText, $leftText)
     }
     if ($Counter) {
         $withCounter = "$detail  ($Counter)"
@@ -1278,7 +1396,7 @@ function Show-TransferProgress {
         # native PowerShell progress bar with the same numbers in its status text.
         $status = ($detail -replace '\s{2,}', ' ').Trim()
         if ($Counter -and $compact) { $status += " ($Counter)" }
-        $percent = if ($fraction -ge 0) { [Math]::Min(100, [int][Math]::Floor($fraction * 100)) } else { -1 }
+        $percent = if ($Completed) { 100 } elseif ($percentValue -ge 0) { [Math]::Min(99, [int][Math]::Floor([double]$percentValue)) } else { -1 }
         try { Write-Progress -Activity $Activity -Status $status -PercentComplete $percent } catch { }
         if ($Completed) { try { Write-Progress -Activity $Activity -Completed } catch { } }
         return
@@ -1293,11 +1411,15 @@ function Show-TransferProgress {
     $barColor = if ($Completed) { 'Green' } else { 'Cyan' }
     Write-Host "`r    [" -NoNewline -ForegroundColor DarkGray
     if ($fraction -ge 0) {
-        $filled = [int][Math]::Round($fraction * $barWidth)
-        if ($filled -lt 0) { $filled = 0 }
-        if ($filled -gt $barWidth) { $filled = $barWidth }
-        # Keep at least one block visible as soon as the transfer has started.
-        if (($filled -eq 0) -and ($ReceivedBytes -gt 0) -and (-not $Completed)) { $filled = 1 }
+        if ($Completed) {
+            $filled = $barWidth
+        } else {
+            $filled = [int][Math]::Floor($fraction * $barWidth)
+            if ($filled -lt 0) { $filled = 0 }
+            # Keep one block visible once started, and leave at least one slot open until finished.
+            if (($filled -eq 0) -and ($ReceivedBytes -gt 0)) { $filled = 1 }
+            if ($filled -ge $barWidth) { $filled = $barWidth - 1 }
+        }
         Write-Host ('#' * $filled) -NoNewline -ForegroundColor $barColor
         Write-Host ('-' * ($barWidth - $filled)) -NoNewline -ForegroundColor DarkGray
     } else {
@@ -1341,6 +1463,50 @@ function Get-SmoothedSpeed {
     return (0.65 * $CurrentSmoothedSpeed) + (0.35 * $InstantSpeed)
 }
 
+function Get-ResponseTotalBytes {
+    # Resolves the authoritative byte total of an HTTP transfer across fresh (200) and resumed
+    # (206 Partial Content) responses, chunked CDNs, and publisher metadata fallbacks.
+    param(
+        [double]$ContentLength = -1,
+        [AllowNull()][string]$ContentRange = '',
+        [AllowNull()][string]$RawContentLength = '',
+        [AllowNull()][string]$StoredContentLength = '',
+        [AllowNull()][string]$ContentEncoding = '',
+        [double]$ExistingBytes = 0,
+        [bool]$Resumed = $false,
+        [double]$ExpectedBytes = 0
+    )
+    $offset = if (($ExistingBytes -gt 0) -and $Resumed) { $ExistingBytes } else { [double]0 }
+    # RFC 9110 Content-Range ("bytes start-end/total") states the full object size directly,
+    # even when a resumed 206 response omits Content-Length.
+    if (-not [string]::IsNullOrWhiteSpace($ContentRange) -and ($ContentRange -match '(?i)bytes\s+(?:\d+\s*-\s*\d+|\*)\s*/\s*(?<total>\d+)')) {
+        $rangeTotal = [double]0
+        if ([double]::TryParse($Matches['total'], [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$rangeTotal) -and ($rangeTotal -gt 0)) {
+            return $rangeTotal
+        }
+    }
+    # Compressed wire payloads have a smaller Content-Length than the decoded stream.
+    $identityEncoding = [string]::IsNullOrWhiteSpace($ContentEncoding) -or ($ContentEncoding.Trim() -ieq 'identity')
+    if ($identityEncoding) {
+        if ($ContentLength -gt 0) { return ($ContentLength + $offset) }
+        $parsedLength = [double]0
+        if (-not [string]::IsNullOrWhiteSpace($RawContentLength) -and
+            [double]::TryParse($RawContentLength.Trim(), [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedLength) -and
+            ($parsedLength -gt 0)) {
+            return ($parsedLength + $offset)
+        }
+        # Google Cloud Storage (Flutter infra & Android repository) publishes the stored object byte
+        # length here even when an intermediary strips Content-Length for chunked delivery.
+        if (-not [string]::IsNullOrWhiteSpace($StoredContentLength) -and
+            [double]::TryParse($StoredContentLength.Trim(), [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedLength) -and
+            ($parsedLength -gt 0)) {
+            return $parsedLength
+        }
+    }
+    if ($ExpectedBytes -gt $offset) { return $ExpectedBytes }
+    return [double]0
+}
+
 function Get-PartialDownloadPath {
     param([Parameter(Mandatory = $true)][string]$Destination)
     # Partial transfers live next to the target so a retry can resume instead of starting over.
@@ -1352,6 +1518,7 @@ function Receive-FileWithProgress {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$Activity,
+        [double]$ExpectedBytes = 0,
         [switch]$Resume
     )
     $destinationDir = Split-Path -Parent $Destination
@@ -1375,11 +1542,13 @@ function Receive-FileWithProgress {
     $request.AllowAutoRedirect = $true
     $request.Timeout = 60000
     $request.ReadWriteTimeout = 300000
+    try { $request.AutomaticDecompression = [Net.DecompressionMethods]::None } catch { }
     if ($existing -gt 0) {
         try { $request.AddRange([long]$existing) } catch { $existing = [double]0 }
     }
 
     $totalBytes = [double]0
+    $headerTotalBytes = [double]0
     $receivedBytes = $existing
     $elapsedSeconds = [double]0
     $averageSpeed = [double]0
@@ -1390,16 +1559,31 @@ function Receive-FileWithProgress {
         try { $status = $response.StatusCode } catch { }
         $resumed = ($existing -gt 0) -and ($status -eq [Net.HttpStatusCode]::PartialContent)
         if (-not $resumed) { $existing = [double]0 }
-        $contentBytes = [double]$response.ContentLength
-        if ($contentBytes -lt 0) { $contentBytes = 0 }
-        $totalBytes = $contentBytes + $existing
+        $contentRange = ''
+        $rawContentLength = ''
+        $storedContentLength = ''
+        $contentEncoding = ''
+        try {
+            if ($null -ne $response.Headers) {
+                $contentRange = [string]$response.Headers['Content-Range']
+                $rawContentLength = [string]$response.Headers['Content-Length']
+                $storedContentLength = [string]$response.Headers['X-Goog-Stored-Content-Length']
+                $contentEncoding = [string]$response.Headers['Content-Encoding']
+            }
+        } catch { }
+        if ([string]::IsNullOrWhiteSpace($contentEncoding)) {
+            try { $contentEncoding = [string]$response.ContentEncoding } catch { }
+        }
+        $headerTotalBytes = Get-ResponseTotalBytes -ContentLength ([double]$response.ContentLength) -ContentRange $contentRange -RawContentLength $rawContentLength -StoredContentLength $storedContentLength -ContentEncoding $contentEncoding -ExistingBytes $existing -Resumed $resumed -ExpectedBytes 0
+        $totalBytes = if ($headerTotalBytes -gt 0) { $headerTotalBytes } else { Get-ResponseTotalBytes -ExistingBytes $existing -Resumed $resumed -ExpectedBytes $ExpectedBytes }
         try { if ($null -ne $response.ResponseUri) { $finalUri = [string]$response.ResponseUri } } catch { }
         $source = $response.GetResponseStream()
         try {
             if ($resumed) { $output = [IO.File]::Open($part, [IO.FileMode]::Append, [IO.FileAccess]::Write) }
             else { $output = [IO.File]::Create($part) }
             try {
-                $buffer = New-Object 'byte[]' 524288
+                # 64 KB reads keep byte counts, percentages, and ETAs responsive even on slower links.
+                $buffer = New-Object 'byte[]' 65536
                 $clock = [Diagnostics.Stopwatch]::StartNew()
                 $received = $existing
                 $speed = [double]0
@@ -1412,27 +1596,37 @@ function Receive-FileWithProgress {
                     if ($read -le 0) { break }
                     $output.Write($buffer, 0, $read)
                     $received += [double]$read
+                    if (($totalBytes -gt 0) -and ($received -gt $totalBytes) -and ($headerTotalBytes -le 0)) {
+                        $totalBytes = [double]0
+                    }
                     $elapsed = $clock.Elapsed.TotalSeconds
-                    if (($elapsed - $lastSampleAt) -ge 0.5) {
+                    if (($elapsed - $lastSampleAt) -ge 0.25) {
                         $window = $elapsed - $lastSampleAt
                         if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($received - $lastSampleBytes) / $window) }
                         $lastSampleAt = $elapsed
                         $lastSampleBytes = $received
                     }
-                    $finished = ($totalBytes -gt 0) -and ($received -ge $totalBytes)
-                    if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+                    if (($elapsed - $lastRender) -ge 0.12) {
                         $lastRender = $elapsed
-                        $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $received) / $speed } else { -1 }
-                        Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Completed:$finished
+                        $effectiveSpeed = $speed
+                        if (($effectiveSpeed -le 0) -and ($elapsed -gt 0.05) -and ($received -gt $existing)) {
+                            $effectiveSpeed = ($received - $existing) / $elapsed
+                        }
+                        $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $received) / $effectiveSpeed) } else { -1 }
+                        Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining
                     }
                 }
                 $output.Flush($true)
                 $clock.Stop()
                 $seconds = $clock.Elapsed.TotalSeconds
-                Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Completed
+                if (($seconds -gt 0) -and ($received -gt $existing)) {
+                    $averageSpeed = ($received - $existing) / $seconds
+                    if ($speed -le 0) { $speed = $averageSpeed }
+                }
+                $finalTotal = if ($totalBytes -gt 0) { $totalBytes } else { $received }
+                Show-TransferProgress -Activity $Activity -ReceivedBytes $received -TotalBytes $finalTotal -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Completed
                 $receivedBytes = $received
                 $elapsedSeconds = $seconds
-                if (($seconds -gt 0) -and ($received -gt $existing)) { $averageSpeed = ($received - $existing) / $seconds }
             } finally { $output.Dispose() }
         } finally { $source.Dispose() }
     } finally { $response.Close() }
@@ -1441,8 +1635,9 @@ function Receive-FileWithProgress {
     $written = [double]0
     try { if (Test-Path -LiteralPath $part -PathType Leaf) { $written = [double](Get-Item -LiteralPath $part).Length } } catch { $written = [double]0 }
     if ($written -le 0) { throw 'The download produced no data.' }
-    if (($totalBytes -gt 0) -and ($written -lt $totalBytes)) {
-        throw "The transfer ended after $(Format-ByteSize $written) of $(Format-ByteSize $totalBytes); the next attempt resumes from the partial file."
+    $expectedCompleteBytes = if ($headerTotalBytes -gt 0) { $headerTotalBytes } else { $totalBytes }
+    if (($expectedCompleteBytes -gt 0) -and ($written -lt $expectedCompleteBytes)) {
+        throw "The transfer ended after $(Format-ByteSize $written) of $(Format-ByteSize $expectedCompleteBytes); the next attempt resumes from the partial file."
     }
     Move-Item -LiteralPath $part -Destination $Destination -Force
     return [pscustomobject]@{ Bytes = $written; Seconds = $elapsedSeconds; AverageSpeed = $averageSpeed; Source = $finalUri }
@@ -1486,7 +1681,8 @@ function Download-File {
         [Parameter(Position = 2)][string]$Label,
         # Published SHA-256 values are verified when the source offers one; the computed hash is
         # always printed so a suspect download can still be compared by hand.
-        [string]$ExpectedSha256 = '',
+        [Parameter(Position = 3)][string]$ExpectedSha256 = '',
+        [double]$ExpectedBytes = 0,
         [int]$Attempts = 3
     )
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -1502,7 +1698,7 @@ function Download-File {
     $lastFailure = ''
     for ($attempt = 1; $attempt -le $totalAttempts; $attempt++) {
         try {
-            $result = Receive-FileWithProgress -Url $Url -Destination $Destination -Activity $activity -Resume:($attempt -gt 1)
+            $result = Receive-FileWithProgress -Url $Url -Destination $Destination -Activity $activity -ExpectedBytes $ExpectedBytes -Resume:($attempt -gt 1)
             break
         } catch {
             $lastFailure = $_.Exception.Message
@@ -1567,18 +1763,9 @@ function Expand-ZipWithProgress {
     $archive = [IO.Compression.ZipFile]::OpenRead($LiteralPath)
     try {
         $entries = @($archive.Entries)
-        $totalEntries = $entries.Count
-        if ($totalEntries -eq 0) { return }
-        $totalBytes = [double]($entries | Measure-Object -Property Length -Sum).Sum
-        $createdDirectories = @{}
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        $doneBytes = [double]0
-        $doneEntries = 0
-        $speed = [double]0
-        $lastRender = [double]-1
-        $lastSampleAt = [double]0
-        $lastSampleBytes = [double]0
-        Show-TransferProgress -Activity $Activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,6}/{1,5} files' -f 0, $totalEntries)
+        if ($entries.Count -eq 0) { return }
+        $safeItems = New-Object 'System.Collections.Generic.List[object]'
+        $totalBytes = [double]0
         foreach ($entry in $entries) {
             $relative = $entry.FullName.Replace('\', '/').TrimStart('/')
             if ([string]::IsNullOrWhiteSpace($relative)) { continue }
@@ -1587,34 +1774,78 @@ function Expand-ZipWithProgress {
                 Write-Warning "Skipped an unsafe archive entry: $($entry.FullName)"
                 continue
             }
-            if ($relative.EndsWith('/')) {
-                [void][IO.Directory]::CreateDirectory($target)
+            $isDirectory = $relative.EndsWith('/')
+            $safeItems.Add([pscustomobject]@{ Entry = $entry; Target = $target; IsDirectory = $isDirectory })
+            if (-not $isDirectory) { $totalBytes += [double]$entry.Length }
+        }
+        $totalEntries = $safeItems.Count
+        if ($totalEntries -eq 0) { return }
+        $createdDirectories = @{}
+        $buffer = New-Object 'byte[]' 262144
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $doneBytes = [double]0
+        $doneEntries = 0
+        $speed = [double]0
+        $lastRender = [double]-1
+        $lastSampleAt = [double]0
+        $lastSampleBytes = [double]0
+        Show-TransferProgress -Activity $Activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,6}/{1,5} files' -f 0, $totalEntries)
+        foreach ($item in $safeItems) {
+            if ($item.IsDirectory) {
+                [void][IO.Directory]::CreateDirectory($item.Target)
             } else {
-                $targetDirectory = Split-Path -Parent $target
+                $targetDirectory = Split-Path -Parent $item.Target
                 if (-not $createdDirectories.ContainsKey($targetDirectory)) {
                     [void][IO.Directory]::CreateDirectory($targetDirectory)
                     $createdDirectories[$targetDirectory] = $true
                 }
-                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
-                $doneBytes += [double]$entry.Length
+                # Stream large entries in chunks so multi-hundred-MB files (such as JDK lib\modules)
+                # advance the percentage smoothly instead of jumping all at once on file close.
+                $entryStream = $item.Entry.Open()
+                try {
+                    $fileStream = [IO.File]::Create($item.Target)
+                    try {
+                        while ($true) {
+                            $read = $entryStream.Read($buffer, 0, $buffer.Length)
+                            if ($read -le 0) { break }
+                            $fileStream.Write($buffer, 0, $read)
+                            $doneBytes += [double]$read
+                            $elapsed = $clock.Elapsed.TotalSeconds
+                            if (($elapsed - $lastSampleAt) -ge 0.25) {
+                                $window = $elapsed - $lastSampleAt
+                                if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
+                                $lastSampleAt = $elapsed
+                                $lastSampleBytes = $doneBytes
+                            }
+                            if (($elapsed - $lastRender) -ge 0.12) {
+                                $lastRender = $elapsed
+                                $effectiveSpeed = if (($speed -le 0) -and ($elapsed -gt 0.05)) { $doneBytes / $elapsed } else { $speed }
+                                $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $doneBytes) / $effectiveSpeed) } else { -1 }
+                                Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries)
+                            }
+                        }
+                    } finally { $fileStream.Dispose() }
+                } finally { $entryStream.Dispose() }
+                try { [IO.File]::SetLastWriteTime($item.Target, $item.Entry.LastWriteTime.DateTime) } catch { }
             }
             $doneEntries++
             $elapsed = $clock.Elapsed.TotalSeconds
-            if (($elapsed - $lastSampleAt) -ge 0.5) {
+            if (($elapsed - $lastSampleAt) -ge 0.25) {
                 $window = $elapsed - $lastSampleAt
                 if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
                 $lastSampleAt = $elapsed
                 $lastSampleBytes = $doneBytes
             }
-            $finished = $doneEntries -ge $totalEntries
-            if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+            if (($elapsed - $lastRender) -ge 0.12) {
                 $lastRender = $elapsed
-                $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
-                Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries) -Completed:$finished
+                $effectiveSpeed = if (($speed -le 0) -and ($elapsed -gt 0.05)) { $doneBytes / $elapsed } else { $speed }
+                $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $doneBytes) / $effectiveSpeed) } else { -1 }
+                Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries)
             }
         }
         $clock.Stop()
         $seconds = $clock.Elapsed.TotalSeconds
+        if (($speed -le 0) -and ($seconds -gt 0) -and ($doneBytes -gt 0)) { $speed = $doneBytes / $seconds }
         Show-TransferProgress -Activity $Activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Counter ('{0,6}/{1,5} files' -f $doneEntries, $totalEntries) -Completed
         Complete-TransferProgress -Activity $Activity -Summary ("{0} extracted: {1} in {2}" -f $doneEntries, (Format-ByteSize $doneBytes), (Format-DurationClock $seconds))
     } finally { $archive.Dispose() }
@@ -1680,6 +1911,7 @@ function Copy-TreeWithProgress {
         return
     }
 
+    $buffer = New-Object 'byte[]' 262144
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $doneBytes = [double]0
     $speed = [double]0
@@ -1689,25 +1921,64 @@ function Copy-TreeWithProgress {
     $index = 0
     Show-TransferProgress -Activity $activity -ReceivedBytes 0 -TotalBytes $totalBytes -BytesPerSecond 0 -ElapsedSeconds 0 -RemainingSeconds -1 -Counter ('{0,6}/{1,5} files' -f 0, $files.Count)
     foreach ($file in $files) {
-        Copy-SingleFile -File $file -Target ($destinationRoot + $file.FullName.Substring($sourceRoot.Length))
-        $doneBytes += [double]$file.Length
+        $target = $destinationRoot + $file.FullName.Substring($sourceRoot.Length)
+        if ($file.Length -ge 1048576) {
+            if (Test-Path -LiteralPath $target -PathType Leaf) {
+                try { Set-ItemProperty -LiteralPath $target -Name Attributes -Value ([IO.FileAttributes]::Normal) -ErrorAction SilentlyContinue } catch { }
+            }
+            $inStream = [IO.File]::OpenRead($file.FullName)
+            try {
+                $outStream = [IO.File]::Create($target)
+                try {
+                    while ($true) {
+                        $read = $inStream.Read($buffer, 0, $buffer.Length)
+                        if ($read -le 0) { break }
+                        $outStream.Write($buffer, 0, $read)
+                        $doneBytes += [double]$read
+                        $elapsed = $clock.Elapsed.TotalSeconds
+                        if (($elapsed - $lastSampleAt) -ge 0.25) {
+                            $window = $elapsed - $lastSampleAt
+                            if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
+                            $lastSampleAt = $elapsed
+                            $lastSampleBytes = $doneBytes
+                        }
+                        if (($elapsed - $lastRender) -ge 0.12) {
+                            $lastRender = $elapsed
+                            $effectiveSpeed = if (($speed -le 0) -and ($elapsed -gt 0.05)) { $doneBytes / $elapsed } else { $speed }
+                            $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $doneBytes) / $effectiveSpeed) } else { -1 }
+                            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $index, $files.Count)
+                        }
+                    }
+                } finally { $outStream.Dispose() }
+            } finally { $inStream.Dispose() }
+            $attributes = $file.Attributes
+            if ((($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($attributes -ne [IO.FileAttributes]::Normal)) {
+                try { [IO.File]::SetAttributes($target, $attributes) } catch { }
+            }
+        } else {
+            Copy-SingleFile -File $file -Target $target
+            $doneBytes += [double]$file.Length
+        }
         $index++
         $elapsed = $clock.Elapsed.TotalSeconds
-        if (($elapsed - $lastSampleAt) -ge 0.5) {
+        if (($elapsed - $lastSampleAt) -ge 0.25) {
             $window = $elapsed - $lastSampleAt
             if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
             $lastSampleAt = $elapsed
             $lastSampleBytes = $doneBytes
         }
-        $finished = $index -ge $files.Count
-        if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+        if (($elapsed - $lastRender) -ge 0.12) {
             $lastRender = $elapsed
-            $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
-            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $index, $files.Count) -Completed:$finished
+            $effectiveSpeed = if (($speed -le 0) -and ($elapsed -gt 0.05)) { $doneBytes / $elapsed } else { $speed }
+            $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $doneBytes) / $effectiveSpeed) } else { -1 }
+            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Counter ('{0,6}/{1,5} files' -f $index, $files.Count)
         }
     }
     $clock.Stop()
-    Complete-TransferProgress -Activity $activity -Summary ("{0} copied: {1} in {2}" -f $files.Count, (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
+    $seconds = $clock.Elapsed.TotalSeconds
+    if (($speed -le 0) -and ($seconds -gt 0) -and ($doneBytes -gt 0)) { $speed = $doneBytes / $seconds }
+    Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Counter ('{0,6}/{1,5} files' -f $files.Count, $files.Count) -Completed
+    Complete-TransferProgress -Activity $activity -Summary ("{0} copied: {1} in {2}" -f $files.Count, (Format-ByteSize $doneBytes), (Format-DurationClock $seconds))
 }
 
 function Copy-FileWithProgress {
@@ -1732,7 +2003,7 @@ function Copy-FileWithProgress {
     try {
         $output = [IO.File]::Create($Destination)
         try {
-            $buffer = New-Object 'byte[]' 1048576
+            $buffer = New-Object 'byte[]' 262144
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $doneBytes = [double]0
             $speed = [double]0
@@ -1746,23 +2017,25 @@ function Copy-FileWithProgress {
                 $output.Write($buffer, 0, $read)
                 $doneBytes += [double]$read
                 $elapsed = $clock.Elapsed.TotalSeconds
-                if (($elapsed - $lastSampleAt) -ge 0.5) {
+                if (($elapsed - $lastSampleAt) -ge 0.25) {
                     $window = $elapsed - $lastSampleAt
                     if ($window -gt 0) { $speed = Get-SmoothedSpeed -CurrentSmoothedSpeed $speed -InstantSpeed (($doneBytes - $lastSampleBytes) / $window) }
                     $lastSampleAt = $elapsed
                     $lastSampleBytes = $doneBytes
                 }
-                $finished = ($totalBytes -gt 0) -and ($doneBytes -ge $totalBytes)
-                if ((($elapsed - $lastRender) -ge 0.12) -or $finished) {
+                if (($elapsed - $lastRender) -ge 0.12) {
                     $lastRender = $elapsed
-                    $remaining = if (($totalBytes -gt 0) -and ($speed -gt 2048)) { ($totalBytes - $doneBytes) / $speed } else { -1 }
-                    Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $elapsed -RemainingSeconds $remaining -Completed:$finished
+                    $effectiveSpeed = if (($speed -le 0) -and ($elapsed -gt 0.05)) { $doneBytes / $elapsed } else { $speed }
+                    $remaining = if (($totalBytes -gt 0) -and ($effectiveSpeed -gt 2048)) { [Math]::Max(0, ($totalBytes - $doneBytes) / $effectiveSpeed) } else { -1 }
+                    Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $effectiveSpeed -ElapsedSeconds $elapsed -RemainingSeconds $remaining
                 }
             }
             $output.Flush($true)
             $clock.Stop()
-            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $clock.Elapsed.TotalSeconds -RemainingSeconds 0 -Completed
-            Complete-TransferProgress -Activity $activity -Summary ("{0} copied in {1}" -f (Format-ByteSize $doneBytes), (Format-DurationClock $clock.Elapsed.TotalSeconds))
+            $seconds = $clock.Elapsed.TotalSeconds
+            if (($speed -le 0) -and ($seconds -gt 0) -and ($doneBytes -gt 0)) { $speed = $doneBytes / $seconds }
+            Show-TransferProgress -Activity $activity -ReceivedBytes $doneBytes -TotalBytes $totalBytes -BytesPerSecond $speed -ElapsedSeconds $seconds -RemainingSeconds 0 -Completed
+            Complete-TransferProgress -Activity $activity -Summary ("{0} copied in {1}" -f (Format-ByteSize $doneBytes), (Format-DurationClock $seconds))
         } finally { $output.Dispose() }
     } finally { $sourceStream.Dispose() }
 }
@@ -2755,8 +3028,9 @@ function Install-Flutter {
             Write-Host '[*] Downloading Flutter to a temporary folder...' -ForegroundColor Yellow
             $expectedSha = ''
             if ($source.PSObject.Properties['Sha256']) { $expectedSha = [string]$source.Sha256 }
-            # Positional: Url, Destination, Label, ExpectedSha256.
-            Download-File $source.Path $zip 'Flutter SDK' $expectedSha
+            $expectedBytes = [double]0
+            if ($source.PSObject.Properties['Size'] -and ($source.Size -gt 0)) { $expectedBytes = [double]$source.Size }
+            Download-File $source.Path $zip 'Flutter SDK' -ExpectedSha256 $expectedSha -ExpectedBytes $expectedBytes
         } elseif ($source.Kind -eq 'Zip') {
             Write-Host '[*] Copying the ZIP to a temporary folder. The source file will not be deleted.' -ForegroundColor Yellow
             Copy-FileWithProgress -Source $source.Path -Destination $zip -Label $source.Name

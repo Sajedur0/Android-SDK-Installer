@@ -14,7 +14,8 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
 if (@($parseErrors).Count -gt 0) { throw "Android_SDK.ps1 has parse errors: $(($parseErrors | ForEach-Object { $_.Message }) -join '; ')" }
 
-$wanted = @('Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock', 'Show-TransferProgress',
+$wanted = @('Test-InstallerFlag', 'Test-InlineProgressSupported', 'Get-ProgressLineWidth',
+    'Format-ByteSize', 'Format-DurationClock', 'Get-TransferPercent', 'Show-TransferProgress',
     'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress', 'Get-SmoothedSpeed')
 $definitions = $ast.FindAll({
         param($node)

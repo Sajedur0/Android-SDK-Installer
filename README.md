@@ -31,7 +31,7 @@ Every download and every extraction the installer performs shows a live bar on o
 
 ```
 [*] Downloading Eclipse Temurin JDK 17 (x64) from Adoptium...
-    [##################------------------------]  40.9%     77.7 MB / 190.0 MB      4.1 MB/s  elapsed 00:18  left 00:25
+    [################-------------------------]  40.90%     77.7 MB / 190.0 MB      4.1 MB/s  elapsed 00:18  left 00:25
     [+] Eclipse Temurin JDK 17 (190.0 MB) downloaded in 00:46, average 4.1 MB/s
 ```
 
