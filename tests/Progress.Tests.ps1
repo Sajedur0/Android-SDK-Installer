@@ -39,13 +39,18 @@ if (@($parseErrors).Count -gt 0) { $parseErrors | ForEach-Object { Write-Host " 
 # --- 2. Load only the progress helpers --------------------------------------
 $wanted = @(
     'Format-ProcessArgument', 'Complete-ConsoleLineAfterNative', 'Invoke-ExternalInteractive',
+    'Update-CallerProcessEnvironment', 'Open-EnvironmentRegistryKey', 'Set-OriginalUserEnvironmentVariable',
     'Test-InlineProgressSupported', 'Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock',
     'Get-TransferPercent', 'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
     'Get-SmoothedSpeed', 'Get-ResponseTotalBytes', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
     'Get-WebExceptionStatusCode', 'Get-CmdlineToolsDownloadUrl',
     'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress',
     'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles',
-    'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Get-VolumeFreeBytes', 'Assert-DiskSpace',
+    'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Set-RawPathVariable', 'Add-PathEntry',
+    'Refresh-ProcessPath', 'Broadcast-EnvironmentChange', 'Set-JavaEnvironment',
+    'Get-EffectiveScopePathEntries', 'Get-PathEntryScopes', 'Find-EnvironmentPathExecutable',
+    'Get-CheckEnvironmentVariable', 'Get-EffectiveCheckValue', 'Test-JavaPathConfigured', 'Repair-JavaEnvironmentIfNeeded',
+    'Get-VolumeFreeBytes', 'Assert-DiskSpace',
     'Get-FileSha256', 'Test-FileSha256', 'Test-InteractiveConsoleHost', 'Read-InstallerInput',
     'Get-SdkPackageMarkerPath', 'Test-SdkPackagePresent', 'Get-InstalledSdkPackagesOnDisk', 'Get-PartialSdkPackageFolders',
     'Test-SdkPackageInstalled', 'Get-SdkPackageNamesFromText', 'Get-LatestSdkPackage', 'Get-LatestVersionFolder',
@@ -425,6 +430,7 @@ try {
 # --- 13. The raw PATH is preserved, and the expanding API is not used -------
 Write-Host "`n[13] PATH handling" -ForegroundColor Yellow
 Assert-Equal 'C:\Android\platform-tools' (Normalize-PathEntry 'C:\Android\platform-tools\') 'A trailing separator is removed'
+Assert-Equal 'C:\Program Files\Eclipse Adoptium\jdk-17' (Normalize-PathEntry '"C:\Program Files\Eclipse Adoptium\jdk-17\"') 'Surrounding quotes and trailing separator on JAVA_HOME are removed'
 Assert-Equal '' (Normalize-PathEntry '   ') 'A blank entry normalizes to empty'
 $rawPath = Get-RawPathVariable -Scope 'Machine'
 Assert-True ($null -ne $rawPath) 'The raw Machine PATH can be read'
@@ -642,6 +648,110 @@ foreach ($m in [regex]::Matches($demoWantedMatch.Groups['list'].Value, "'([^']+)
     $foundFn = $ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($n.Name -eq $fnName) }, $true)
     Assert-True (@($foundFn).Count -gt 0) "Progress.Demo.ps1 helper [$fnName] exists in Android_SDK.ps1"
 }
+
+# --- 21. JAVA_HOME and PATH persistence, REG_SZ healing, and shell sync ------
+Write-Host "`n[21] JAVA_HOME & PATH persistence, REG_SZ healing, and shell propagation" -ForegroundColor Yellow
+$work21 = Join-Path ([IO.Path]::GetTempPath()) ('JavaPathTests-' + [guid]::NewGuid().ToString('N'))
+$fakeJdkHome = Join-Path $work21 'jdk-17.0.14.7-hotspot'
+$fakeJdkBin = Join-Path $fakeJdkHome 'bin'
+$fakeOracleShim = Join-Path $work21 'javapath'
+New-Item -ItemType Directory -Path $fakeJdkBin -Force | Out-Null
+New-Item -ItemType Directory -Path $fakeOracleShim -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $fakeJdkBin 'java.exe') -Value 'stub java' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $fakeJdkBin 'javac.exe') -Value 'stub javac' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $fakeOracleShim 'java.exe') -Value 'stale java shim' -Encoding Ascii
+
+$savedJavaHome = $env:JAVA_HOME
+$savedProcessPath = $env:Path
+$origGetRawPath = ${function:Get-RawPathVariable}
+$origSetRawPath = ${function:Set-RawPathVariable}
+$origCheckEnv = ${function:Get-CheckEnvironmentVariable}
+try {
+    # Stub registry PATH state so tests run cleanly on Windows 5.1, Windows 7+, and Linux without
+    # altering real Machine/User registry hives.
+    $script:StubPathStore = @{
+        Machine = [pscustomobject]@{ Value = 'C:\Windows\System32;%JAVA_HOME%\bin'; Expandable = $false; Writes = 0 }
+        User    = [pscustomobject]@{ Value = ''; Expandable = $true; Writes = 0 }
+    }
+    function Get-RawPathVariable {
+        param([ValidateSet('User', 'Machine')][string]$Scope = 'Machine')
+        $entry = $script:StubPathStore[$Scope]
+        return [pscustomobject]@{ Value = [string]$entry.Value; Expandable = [bool]$entry.Expandable }
+    }
+    function Set-RawPathVariable {
+        param(
+            [ValidateSet('User', 'Machine')][string]$Scope = 'Machine',
+            [AllowEmptyString()][string]$Value = '',
+            [bool]$Expandable = $true
+        )
+        $entry = $script:StubPathStore[$Scope]
+        $entry.Value = $Value
+        $entry.Expandable = $Expandable
+        $entry.Writes = [int]$entry.Writes + 1
+        return $true
+    }
+    function Get-CheckEnvironmentVariable {
+        param([Parameter(Mandatory = $true)][string]$Name)
+        return [pscustomobject]@{
+            Process = [Environment]::GetEnvironmentVariable($Name, 'Process')
+            Machine = [Environment]::GetEnvironmentVariable($Name, 'Process')
+            User    = ''
+        }
+    }
+
+    # Regression 1: Unexpanded %JAVA_HOME%\bin inside a corrupted REG_SZ Machine PATH is NOT usable
+    # by new terminals and must NOT trick Add-PathEntry into skipping the literal bin directory.
+    $env:JAVA_HOME = $fakeJdkHome
+    $env:Path = '/usr/bin'
+    Assert-Equal 0 @(Get-PathEntryScopes $fakeJdkBin).Count 'Unexpanded %JAVA_HOME%\bin in REG_SZ PATH is not treated as configured'
+    Assert-True ($null -eq (Find-EnvironmentPathExecutable @('java.exe'))) 'java.exe is reported missing when only unexpanded REG_SZ %JAVA_HOME%\bin exists'
+    Assert-True (-not (Test-JavaPathConfigured)) 'Test-JavaPathConfigured detects missing JAVA_HOME\bin on PATH'
+
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 1 $script:StubPathStore['Machine'].Writes 'Add-PathEntry writes literal JDK bin even when %JAVA_HOME%\bin existed'
+    Assert-True ([bool]$script:StubPathStore['Machine'].Expandable) 'Add-PathEntry repairs corrupted REG_SZ PATH to REG_EXPAND_SZ'
+    $machineSplit = @($script:StubPathStore['Machine'].Value -split ';')
+    Assert-Equal (Normalize-PathEntry $fakeJdkBin) (Normalize-PathEntry $machineSplit[0]) 'Prepend puts literal JAVA_HOME\bin first in Machine PATH'
+    $procSplit = @($env:Path -split ';')
+    Assert-Equal (Normalize-PathEntry $fakeJdkBin) (Normalize-PathEntry $procSplit[0]) 'Prepend puts literal JAVA_HOME\bin first in Process PATH'
+    Assert-True (@(Get-PathEntryScopes $fakeJdkBin) -contains 'Machine') 'Get-PathEntryScopes recognizes persisted JAVA_HOME\bin'
+    Assert-Equal (Join-Path $fakeJdkBin 'java.exe') (Find-EnvironmentPathExecutable @('java.exe')).Path 'java.exe resolves directly to JAVA_HOME\bin\java.exe'
+    Assert-True (Test-JavaPathConfigured) 'Test-JavaPathConfigured succeeds once JAVA_HOME and PATH are configured'
+
+    # Idempotence: already first and already REG_EXPAND_SZ -> zero redundant registry writes.
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 1 $script:StubPathStore['Machine'].Writes 'No redundant registry write when JAVA_HOME\bin is already first and REG_EXPAND_SZ'
+
+    # Self-healing when entry is already at index 0 inside a corrupted REG_SZ key.
+    $script:StubPathStore['Machine'].Expandable = $false
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 2 $script:StubPathStore['Machine'].Writes 'Corrupted REG_SZ PATH is rewritten even when literal entry is already at index 0'
+    Assert-True ([bool]$script:StubPathStore['Machine'].Expandable) 'REG_SZ self-heal restores ExpandString registry type'
+
+    # Prepend ordering: JAVA_HOME\bin moves ahead of stale Oracle javapath shims without duplicating.
+    $script:StubPathStore['Machine'].Value = ($fakeOracleShim + ';C:\Windows\System32;' + $fakeJdkBin)
+    $env:Path = ($fakeOracleShim + ';' + $fakeJdkBin)
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal (Join-Path $fakeJdkBin 'java.exe') (Find-EnvironmentPathExecutable @('java.exe')).Path 'Prepend places JDK ahead of stale javapath shim'
+    $dupCount = @($script:StubPathStore['Machine'].Value -split ';' | Where-Object { (Normalize-PathEntry $_) -ieq (Normalize-PathEntry $fakeJdkBin) }).Count
+    Assert-Equal 1 $dupCount 'Prepend deduplicates existing JAVA_HOME\bin entry'
+} finally {
+    ${function:Get-RawPathVariable} = $origGetRawPath
+    ${function:Set-RawPathVariable} = $origSetRawPath
+    ${function:Get-CheckEnvironmentVariable} = $origCheckEnv
+    $env:JAVA_HOME = $savedJavaHome
+    $env:Path = $savedProcessPath
+    Remove-Item -LiteralPath $work21 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Static wiring guards for Ensure-Jdk, Broadcast-EnvironmentChange, and Run.bat propagation.
+Assert-True ($scriptText -match 'Set-JavaEnvironment -JavaHome \$jdk\.JavaHome') 'Ensure-Jdk configures JAVA_HOME and PATH through Set-JavaEnvironment'
+Assert-True ($scriptText -match 'SendMessageTimeoutW' -and $scriptText -match 'SendMessageTimeoutA') 'Broadcast-EnvironmentChange sends both Unicode and ANSI WM_SETTINGCHANGE'
+$runBatPath = Join-Path $repoRoot 'Run.bat'
+$runBatRaw = [IO.File]::ReadAllText($runBatPath)
+Assert-True ($runBatRaw -notmatch '(?m)^setlocal\s*$') 'Run.bat does not trap environment updates inside setlocal'
+Assert-True ($runBatRaw -match '-PrintShellEnv') 'Run.bat propagates JAVA_HOME and PATH back into cmd.exe'
+Assert-True (($runBatRaw -replace "`r`n", '') -notmatch "`n") 'Run.bat preserves CRLF line endings for cmd.exe'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 

@@ -172,6 +172,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Android_SDK.ps1 -SdkRoot D:\
 | `ANDROID_SDK_INSTALLER_AVD_NAME` | Same as `-AvdName`. |
 | `ANDROID_SDK_INSTALLER_SYSTEM_IMAGE` | Same as `-SystemImage`. |
 | `ANDROID_SDK_INSTALLER_EMULATOR_PATH=Y` / `N` | Add (or do not add) the Emulator folder to Machine `PATH` during option 4. Without it, an unattended run leaves `PATH` untouched. |
+| `ANDROID_SDK_INSTALLER_REPAIR_ENV=Y` / `N` | Control whether option 3 repairs missing `JAVA_HOME`, `ANDROID_HOME`, `FLUTTER_ROOT`, or `PATH` entries for tools already on disk (defaults to read-only `N` in unattended runs). |
 | `ANDROID_SDK_INSTALLER_NO_AVD=1` | Install the Emulator and system image but skip AVD creation. |
 | `ANDROID_SDK_INSTALLER_CMDLINE_TOOLS_BUILD` | Pin the command-line tools build number instead of reading it from the download page. |
 | `ANDROID_SDK_INSTALLER_CMAKE_MAJOR` | Which CMake major to install (default 3). |
