@@ -1462,6 +1462,23 @@ function Receive-FileSimple {
     return [pscustomobject]@{ Bytes = [double](Get-Item -LiteralPath $Destination).Length; Seconds = 0; AverageSpeed = 0; Source = $Url }
 }
 
+function Get-WebExceptionStatusCode {
+    param([System.Exception]$Exception)
+    # A refused GetResponse()/DownloadFile() arrives in a catch block as a MethodInvocationException
+    # ('Exception calling "GetResponse" with "0" argument(s): "... (404) Not Found."'), so the
+    # WebException carrying the HTTP status is an inner exception, never the caught one itself.
+    # Testing only the outer exception makes every 404 look transient and burns all the retries.
+    $current = $Exception
+    while ($null -ne $current) {
+        if ($current -is [Net.WebException]) {
+            try { if ($null -ne $current.Response) { return [int]$current.Response.StatusCode } } catch { }
+            return 0
+        }
+        $current = $current.InnerException
+    }
+    return 0
+}
+
 function Download-File {
     param(
         [Parameter(Mandatory = $true, Position = 0)][string]$Url,
@@ -1490,12 +1507,12 @@ function Download-File {
         } catch {
             $lastFailure = $_.Exception.Message
             Reset-TransferProgress -Activity $activity
-            $serverStatus = 0
-            if ($_.Exception -is [Net.WebException]) { try { $serverStatus = [int]$_.Exception.Response.StatusCode } catch { $serverStatus = 0 } }
+            $serverStatus = Get-WebExceptionStatusCode -Exception $_.Exception
             if (($serverStatus -ge 400) -and ($serverStatus -lt 500) -and ($serverStatus -ne 408) -and ($serverStatus -ne 429)) {
-                # A missing or forbidden resource will not improve on a retry.
+                # A missing or forbidden resource will not improve on a retry. Naming the address
+                # matters: a mistyped URL is otherwise indistinguishable from a server outage.
                 if (Test-Path -LiteralPath $part -PathType Leaf) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-                throw "The server rejected the download of ${Label}: HTTP $serverStatus. $lastFailure"
+                throw "The server rejected the download of ${Label}: HTTP $serverStatus from $Url. $lastFailure"
             }
             $partialBytes = [double]0
             if (Test-Path -LiteralPath $part -PathType Leaf) { try { $partialBytes = [double](Get-Item -LiteralPath $part).Length } catch { $partialBytes = [double]0 } }
@@ -1512,7 +1529,7 @@ function Download-File {
             if ($partialBytes -gt 0) { throw "The download of $Label stopped after $(Format-ByteSize $partialBytes). $lastFailure" }
             Write-Host "[!] The live progress bar could not start for $Label ($lastFailure). Retrying with a plain download..." -ForegroundColor Yellow
             try { $result = Receive-FileSimple -Url $Url -Destination $Destination }
-            catch { throw "The download failed for ${Label}: $($_.Exception.Message)" }
+            catch { throw "The download failed for ${Label} from ${Url}: $($_.Exception.Message)" }
         }
     }
     if ($null -eq $result) { throw "The download of $Label did not complete after $totalAttempts attempt(s). $lastFailure" }
@@ -2143,6 +2160,15 @@ function Move-LegacyCmdlineToolsBackups {
     return $moved
 }
 
+function Get-CmdlineToolsDownloadUrl {
+    param([Parameter(Mandatory = $true)][string]$Build)
+    # Google's archive name is "commandlinetools-win-<build>_latest.zip": a hyphen before the build,
+    # an underscore before "latest". Putting an underscore in place of that hyphen produces a
+    # plausible-looking address that only ever answers 404, so the URL is built in this one place
+    # (matching the pattern the download page scrape looks for) and its shape is pinned by a test.
+    return "https://dl.google.com/android/repository/commandlinetools-win-$($Build.Trim())_latest.zip"
+}
+
 function Get-LatestCmdlineToolsInfo {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     # Last known build, used only if the Android developer page cannot be read.
@@ -2177,7 +2203,7 @@ function Get-LatestCmdlineToolsInfo {
         $build = $fallbackBuild
     }
     Write-Host "[*] Latest command-line tools build: $build" -ForegroundColor Yellow
-    return [pscustomobject]@{ Build = $build; Url = "https://dl.google.com/android/repository/commandlinetools-win_$($build)_latest.zip" }
+    return [pscustomobject]@{ Build = $build; Url = (Get-CmdlineToolsDownloadUrl -Build $build) }
 }
 
 # ---------------------------------------------------------------------------
