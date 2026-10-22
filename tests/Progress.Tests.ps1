@@ -47,7 +47,10 @@ $wanted = @(
     'Get-FileSha256', 'Test-FileSha256', 'Test-InteractiveConsoleHost', 'Read-InstallerInput',
     'Get-SdkPackageMarkerPath', 'Test-SdkPackagePresent', 'Get-InstalledSdkPackagesOnDisk', 'Get-PartialSdkPackageFolders',
     'Test-SdkPackageInstalled', 'Get-SdkPackageNamesFromText', 'Get-LatestSdkPackage', 'Get-LatestVersionFolder',
-    'Test-CmdlineToolsDirectory', 'Test-AndroidSdkRoot', 'Get-SdkPackageManagerHint'
+    'Test-CmdlineToolsDirectory', 'Test-AndroidSdkRoot', 'Get-SdkPackageManagerHint',
+    'Get-EmulatorAbi', 'Get-DefaultSystemImage', 'Test-SystemImagePackage', 'ConvertTo-AvdName',
+    'Get-AvdRoot', 'Get-AvdNames', 'Get-SystemImageFolders', 'Get-SdkPackageManagerPaths',
+    'ConvertFrom-FlutterReleaseCache', 'Test-InstallerFlag'
 )
 $definitions = $ast.FindAll({
         param($node)
@@ -429,7 +432,104 @@ Assert-True ($scriptText -notmatch "\[Environment\]::SetEnvironmentVariable\('Pa
 Assert-True ($scriptText -match 'exit 1') 'A handled failure leaves a non-zero exit code'
 Assert-Equal 2 ([regex]::Matches($scriptText, 'Read-Host')).Count 'Only the guarded helpers read the console'
 $flutterSection = [regex]::Match($scriptText, '(?s)function Install-Flutter.*?FLUTTER INSTALLATION VERIFIED').Value
-Assert-True ($flutterSection -notmatch "Get-SdkLicenseAnswers 'y'\)") 'Flutter does not accept licenses by default'
+Assert-True ($flutterSection -match 'if \(\$licensesRecorded -or \$acceptForUser\)') 'Flutter only answers license prompts when they are already recorded'
+
+# --- 15. Emulator and virtual device helpers --------------------------------
+Write-Host "`n[15] Emulator and AVD helpers" -ForegroundColor Yellow
+
+# The system image ABI follows the host CPU.
+Assert-Equal 'x86_64' (Get-EmulatorAbi -Architecture 'AMD64') 'Intel/AMD hosts use x86_64 images'
+Assert-Equal 'arm64-v8a' (Get-EmulatorAbi -Architecture 'ARM64') 'Windows on ARM uses arm64-v8a images'
+Assert-Equal 'x86_64' (Get-EmulatorAbi -Architecture '') 'An unknown architecture falls back to x86_64'
+Assert-Equal 'system-images;android-36;google_apis;x86_64' (Get-DefaultSystemImage -Api 36 -Abi 'x86_64') 'The default system image matches the API level and ABI'
+Assert-Equal 'system-images;android-34;google_apis;arm64-v8a' (Get-DefaultSystemImage -Api 34 -Abi 'arm64-v8a') 'The default system image follows the API level'
+
+# Package ids are validated before a multi-gigabyte download starts.
+Assert-True (Test-SystemImagePackage 'system-images;android-36;google_apis;x86_64') 'A valid system image id is accepted'
+Assert-True (Test-SystemImagePackage 'system-images;android-36;google_apis_playstore;arm64-v8a') 'A Play Store image id is accepted'
+Assert-True (-not (Test-SystemImagePackage 'emulator')) 'A plain package is not a system image'
+Assert-True (-not (Test-SystemImagePackage 'system-images;android-36;google_apis')) 'An incomplete system image id is rejected'
+Assert-True (-not (Test-SystemImagePackage '')) 'An empty package id is rejected'
+
+# AVD names are used as file names, so unsafe characters are replaced.
+Assert-Equal 'Pixel_Api36' (ConvertTo-AvdName -Name '' -Api 36) 'An empty name gets an API-specific default'
+Assert-Equal 'My_Phone' (ConvertTo-AvdName -Name 'My Phone!' -Api 36) 'Spaces and punctuation become underscores'
+Assert-Equal 'Pixel_Api34' (ConvertTo-AvdName -Name '   ' -Api 34) 'A blank name falls back to the default'
+Assert-Equal 'api36' (ConvertTo-AvdName -Name '__api36__' -Api 36) 'Repeated and edge underscores are trimmed'
+
+# AVDs are read from the signed-in user's profile.
+$profilePath = Join-Path $work 'profile'
+$avdRoot = Join-Path (Join-Path $profilePath '.android') 'avd'
+Assert-Equal $avdRoot (Get-AvdRoot -ProfilePath $profilePath) 'The AVD root follows the user profile'
+$null = New-Item -ItemType Directory -Path (Join-Path $avdRoot 'Pixel_Api36.avd') -Force
+Set-Content -LiteralPath (Join-Path $avdRoot 'Pixel_Api36.ini') -Value 'path=Pixel_Api36.avd' -Encoding Ascii
+Assert-Equal 'Pixel_Api36' (@(Get-AvdNames -AvdRoot $avdRoot) -join ',') 'AVD ini files are listed'
+Assert-Equal 0 @(Get-AvdNames -AvdRoot (Join-Path $work 'no-such-avd-root')).Count 'A missing AVD folder lists nothing'
+
+# A system image needs its system.img before it counts as installed.
+$emulatorSdk = Join-Path $work 'emulator-sdk'
+$imageFolder = Join-Path $emulatorSdk 'system-images\android-36\google_apis\x86_64'
+$null = New-Item -ItemType Directory -Path $imageFolder -Force
+Set-Content -LiteralPath (Join-Path $imageFolder 'system.img') -Value 'stub image' -Encoding Ascii
+Assert-Equal (Join-Path $emulatorSdk 'system-images\android-36\google_apis\x86_64\system.img') (Get-SdkPackageMarkerPath -SdkRoot $emulatorSdk -Package 'system-images;android-36;google_apis;x86_64') 'The system image marker is system.img'
+Assert-True (Test-SdkPackagePresent -SdkRoot $emulatorSdk -Package 'system-images;android-36;google_apis;x86_64') 'A complete system image counts as installed'
+Assert-True (-not (Test-SdkPackagePresent -SdkRoot $emulatorSdk -Package 'system-images;android-36;google_apis_playstore;x86_64')) 'Another image is not reported as installed'
+Assert-Equal 'system-images;android-36;google_apis;x86_64' (@(Get-SystemImageFolders -SdkRoot $emulatorSdk) -join ',') 'Installed system images are listed'
+$null = New-Item -ItemType Directory -Path (Join-Path $emulatorSdk 'emulator') -Force
+Set-Content -LiteralPath (Join-Path $emulatorSdk 'emulator\emulator.exe') -Value 'stub' -Encoding Ascii
+$emulatorPackages = @(Get-InstalledSdkPackagesOnDisk $emulatorSdk)
+Assert-True ($emulatorPackages -contains 'emulator') 'emulator.exe marks the Emulator as installed'
+Assert-True ($emulatorPackages -contains 'system-images;android-36;google_apis;x86_64') 'An installed system image is reported on disk'
+
+# The package managers are discovered once and described the same way everywhere.
+$managerPaths = Get-SdkPackageManagerPaths -SdkRoot $emulatorSdk
+Assert-Equal '' $managerPaths.SdkManager 'A missing sdkmanager is reported as empty'
+Assert-Equal (Join-Path $emulatorSdk 'emulator\emulator.exe') $managerPaths.Emulator 'The Emulator executable is discovered'
+$null = New-Item -ItemType Directory -Path (Join-Path $emulatorSdk 'cmdline-tools\latest\bin') -Force
+Set-Content -LiteralPath (Join-Path $emulatorSdk 'cmdline-tools\latest\bin\sdkmanager.bat') -Value '@echo off' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $emulatorSdk 'cmdline-tools\latest\bin\avdmanager.bat') -Value '@echo off' -Encoding Ascii
+$managerPaths = Get-SdkPackageManagerPaths -SdkRoot $emulatorSdk
+Assert-Equal (Join-Path $emulatorSdk 'cmdline-tools\latest\bin\sdkmanager.bat') $managerPaths.SdkManager 'sdkmanager is discovered'
+Assert-Equal (Join-Path $emulatorSdk 'cmdline-tools\latest\bin\avdmanager.bat') $managerPaths.AvdManager 'avdmanager is discovered'
+
+# --- 16. The new menu entries and console flags are wired in ------------------
+Write-Host "`n[16] Menu and unattended wiring" -ForegroundColor Yellow
+Assert-True ($scriptText -match "4\. Android Emulator") 'The menu offers the Emulator option'
+Assert-True ($scriptText -match 'Install everything') 'The menu offers the full setup'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_FLUTTER_ROOT') 'The Flutter root can be overridden'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_AVD_NAME') 'The AVD name can be overridden'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_SYSTEM_IMAGE') 'The system image can be overridden'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_EMULATOR_PATH') 'The Emulator PATH entry is opt-in'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_NO_AVD') 'AVD creation can be skipped'
+Assert-True ($scriptText -match "WindowsPowerShell\\v1\.0\\powershell\.exe") 'Elevation uses the Windows PowerShell 5.1 host'
+Assert-True ($scriptText -match 'ANDROID_SDK_INSTALLER_FLUTTER_DOWNLOAD') 'The automatic Flutter download can be enabled unattended'
+Assert-True ($scriptText -match '--- Git for Windows ---') 'The environment check covers Git'
+
+# --- 17. The automatic Flutter release lookup --------------------------------
+Write-Host "`n[17] Flutter release cache" -ForegroundColor Yellow
+$flutterSha = 'c2c875da25a1a1448d18ee4e8f398b2f6fce888b4775d8f9130538e16d826cb4'
+$flutterUrl = 'https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_3.47.7-stable.zip'
+$release = ConvertFrom-FlutterReleaseCache "3.47.7|$flutterUrl|$flutterSha"
+Assert-Equal '3.47.7' $release.Version 'The cached Flutter version is read back'
+Assert-Equal 'Url' $release.Kind 'The automatic release is treated as a download'
+Assert-Equal $flutterUrl $release.Path 'The cached Flutter archive URL is read back'
+Assert-Equal $flutterSha $release.Sha256 'The published SHA-256 is read back'
+Assert-True ($release.Name -match '3\.47\.7') 'The release label carries the version'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache '')) 'An empty cache entry is ignored'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache 'not a release')) 'A malformed cache entry is ignored'
+Assert-True ($null -eq (ConvertFrom-FlutterReleaseCache "3.47.7|ftp://example.com/flutter.zip|$flutterSha")) 'A non-HTTP archive URL is rejected'
+$releaseWithoutSha = ConvertFrom-FlutterReleaseCache "3.47.7|$flutterUrl|"
+Assert-Equal '' $releaseWithoutSha.Sha256 'A missing hash leaves verification off, not broken'
+Assert-Equal $flutterUrl $releaseWithoutSha.Path 'The URL without a hash still parses'
+
+# --- 18. Environment switches ------------------------------------------------
+Write-Host "`n[18] Environment switches" -ForegroundColor Yellow
+foreach ($value in @('1', 'Y', 'yes', 'TRUE', 'on')) {
+    Assert-True (Test-InstallerFlag $value) "Switch value [$value] is on"
+}
+foreach ($value in @('', '0', 'N', 'no', 'false', 'off', 'maybe')) {
+    Assert-True (-not (Test-InstallerFlag $value)) "Switch value [$value] is off"
+}
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
