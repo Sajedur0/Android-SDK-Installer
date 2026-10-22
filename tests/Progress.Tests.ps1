@@ -41,6 +41,7 @@ $wanted = @(
     'Test-InlineProgressSupported', 'Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock',
     'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
     'Get-SmoothedSpeed', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
+    'Get-WebExceptionStatusCode', 'Get-CmdlineToolsDownloadUrl',
     'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress',
     'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles',
     'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Get-VolumeFreeBytes', 'Assert-DiskSpace',
@@ -234,11 +235,13 @@ Assert-Equal (Get-FileHash -LiteralPath (Join-Path $payload 'nested\deeper\two.b
 Write-Host "`n[7] Download-File with a live progress bar" -ForegroundColor Yellow
 $downloadTarget = Join-Path $work 'downloaded.bin'
 $downloadUrl = 'https://raw.githubusercontent.com/Sajedur0/Android-SDK-Installer/main/README.md'
+$liveDownloadWorked = $false
 try {
     Download-File $downloadUrl $downloadTarget 'README.md'
     Assert-True ((Get-Item -LiteralPath $downloadTarget).Length -gt 1024) 'Downloaded file is not empty'
     $head = (Get-Content -LiteralPath $downloadTarget -TotalCount 1)
     Assert-True ($head -match 'Android SDK') 'Downloaded content looks like the README'
+    $liveDownloadWorked = $true
 } catch {
     Write-Host "  SKIP live download: $($_.Exception.Message)" -ForegroundColor Yellow
 }
@@ -246,9 +249,15 @@ try {
 # A failed download must not leave a partial file behind.
 $failedTarget = Join-Path $work 'missing.bin'
 $failed = $false
+$failedMessage = ''
 try { Download-File 'https://raw.githubusercontent.com/Sajedur0/Android-SDK-Installer/main/does-not-exist-404.bin' $failedTarget 'missing file' }
-catch { $failed = $true }
+catch { $failed = $true; $failedMessage = $_.Exception.Message }
 Assert-True $failed 'A 404 download raises an error'
+if ($liveDownloadWorked) {
+    # The 404 arrives wrapped as 'Exception calling "GetResponse"...', so it only reads as HTTP 404
+    # when the WebException is unwrapped. Without that the download is needlessly retried instead.
+    Assert-True ($failedMessage -match 'HTTP 404') 'A 404 is reported as HTTP 404 at once, not retried as a transient failure'
+}
 Assert-True (-not (Test-Path -LiteralPath $failedTarget)) 'A failed download leaves no partial file'
 Assert-True (-not (Test-Path -LiteralPath "$failedTarget.part")) 'A failed download leaves no resumable chunk either'
 if (Test-Path -LiteralPath $downloadTarget) {
@@ -530,6 +539,25 @@ foreach ($value in @('1', 'Y', 'yes', 'TRUE', 'on')) {
 foreach ($value in @('', '0', 'N', 'no', 'false', 'off', 'maybe')) {
     Assert-True (-not (Test-InstallerFlag $value)) "Switch value [$value] is off"
 }
+
+# --- 19. The command-line tools download address -------------------------------
+Write-Host "`n[19] Command-line tools download URL" -ForegroundColor Yellow
+# Google publishes commandlinetools-win-<build>_latest.zip. Building the address with an underscore
+# before the build instead made Step 2 download a file that never existed, so every install 404'd.
+Assert-Equal 'https://dl.google.com/android/repository/commandlinetools-win-15859902_latest.zip' (Get-CmdlineToolsDownloadUrl -Build '15859902') 'The download URL uses a hyphen before the build and an underscore before latest'
+Assert-True ((Get-CmdlineToolsDownloadUrl -Build '15859902') -notmatch 'commandlinetools-win_') 'The download URL never puts an underscore before the build'
+Assert-True ($scriptText -notmatch 'commandlinetools-win_') 'No underscore-before-build address survives anywhere in the installer'
+Assert-True ($scriptText -match 'Get-CmdlineToolsDownloadUrl -Build \$build') 'The version lookup builds its address through the tested helper'
+# The built address must be a name the download-page scrape itself recognizes, with the build intact.
+$scrapeHits = @([regex]::Matches((Get-CmdlineToolsDownloadUrl -Build '15859902'), 'commandlinetools-win-(\d+)_latest\.zip'))
+Assert-Equal 1 $scrapeHits.Count 'The built URL matches the pattern scraped from the Android developer page'
+if ($scrapeHits.Count -gt 0) {
+    Assert-Equal '15859902' $scrapeHits[0].Groups[1].Value 'The scraped pattern recovers the build from the built URL'
+}
+# Only a real (possibly wrapped) WebException carries a status; anything else must not be mistaken for one.
+Assert-Equal 0 (Get-WebExceptionStatusCode -Exception $null) 'A missing exception carries no HTTP status'
+Assert-Equal 0 (Get-WebExceptionStatusCode -Exception ([System.Exception]::new('boom'))) 'A non-web exception carries no HTTP status'
+Assert-Equal 0 (Get-WebExceptionStatusCode -Exception ([System.Exception]::new('outer', [Net.WebException]::new('inner')))) 'A wrapped WebException without a response carries no HTTP status'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
