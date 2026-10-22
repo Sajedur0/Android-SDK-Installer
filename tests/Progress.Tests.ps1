@@ -38,13 +38,19 @@ if (@($parseErrors).Count -gt 0) { $parseErrors | ForEach-Object { Write-Host " 
 
 # --- 2. Load only the progress helpers --------------------------------------
 $wanted = @(
+    'Format-ProcessArgument', 'Complete-ConsoleLineAfterNative', 'Invoke-ExternalInteractive',
+    'Update-CallerProcessEnvironment', 'Open-EnvironmentRegistryKey', 'Set-OriginalUserEnvironmentVariable',
     'Test-InlineProgressSupported', 'Get-ProgressLineWidth', 'Format-ByteSize', 'Format-DurationClock',
-    'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
-    'Get-SmoothedSpeed', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
+    'Get-TransferPercent', 'Show-TransferProgress', 'Close-InlineProgressLine', 'Reset-TransferProgress', 'Complete-TransferProgress',
+    'Get-SmoothedSpeed', 'Get-ResponseTotalBytes', 'Copy-SingleFile', 'Receive-FileWithProgress', 'Receive-FileSimple', 'Download-File',
     'Get-WebExceptionStatusCode', 'Get-CmdlineToolsDownloadUrl',
     'Expand-ZipWithProgress', 'Expand-ArchiveWithProgress', 'Copy-TreeWithProgress', 'Copy-FileWithProgress',
     'Get-SdkLicenseAnswers', 'Get-SdkLicenseStatusFromText', 'Get-SdkLicenseFileHashes', 'Write-SdkLicenseFiles',
-    'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Get-VolumeFreeBytes', 'Assert-DiskSpace',
+    'Normalize-PathEntry', 'Get-ShortHash', 'Get-RawPathVariable', 'Set-RawPathVariable', 'Add-PathEntry',
+    'Refresh-ProcessPath', 'Broadcast-EnvironmentChange', 'Set-JavaEnvironment',
+    'Get-EffectiveScopePathEntries', 'Get-PathEntryScopes', 'Find-EnvironmentPathExecutable',
+    'Get-CheckEnvironmentVariable', 'Get-EffectiveCheckValue', 'Test-JavaPathConfigured', 'Repair-JavaEnvironmentIfNeeded',
+    'Get-VolumeFreeBytes', 'Assert-DiskSpace',
     'Get-FileSha256', 'Test-FileSha256', 'Test-InteractiveConsoleHost', 'Read-InstallerInput',
     'Get-SdkPackageMarkerPath', 'Test-SdkPackagePresent', 'Get-InstalledSdkPackagesOnDisk', 'Get-PartialSdkPackageFolders',
     'Test-SdkPackageInstalled', 'Get-SdkPackageNamesFromText', 'Get-LatestSdkPackage', 'Get-LatestVersionFolder',
@@ -128,19 +134,28 @@ $line = Get-RenderedProgressLine -Arguments @{
     BytesPerSecond = 4320000; ElapsedSeconds = 18.9; RemainingSeconds = 25.2
 }
 Write-Host "  sample: |$line|" -ForegroundColor Cyan
-Assert-True ($line -match '40\.9%') 'Shows the percentage'
+Assert-True ($line -match '40\.90%') 'Shows the percentage to two decimals without rounding ahead'
 Assert-True ($line -match '77\.7 MB') 'Shows megabytes downloaded'
 Assert-True ($line -match '190\.0 MB') 'Shows the total megabytes'
 Assert-True ($line -match '4\.1 MB/s') 'Shows the download speed'
 Assert-True ($line -match 'elapsed 00:18') 'Shows elapsed time'
 Assert-True ($line -match 'left 00:25') 'Shows time remaining'
 
-# A completed transfer ends on a full green bar at 100 percent.
+# An in-flight transfer near the end must neither claim 100.00% nor fill the whole bar early.
+$almostDone = Get-RenderedProgressLine -Arguments @{
+    Activity = 'Downloading Eclipse Temurin JDK 17'; ReceivedBytes = 199150000; TotalBytes = 199229440
+    BytesPerSecond = 4100000; ElapsedSeconds = 46.2; RemainingSeconds = 0.02
+}
+Assert-True ($almostDone -match '99\.96%') 'Near-complete frame reports exact completed hundredths'
+Assert-True ($almostDone -notmatch '100\.00%') 'Near-complete frame does not round up to 100.00%'
+Assert-True ($almostDone -match '\[#+-\]') 'Near-complete bar leaves at least one slot open until finished'
+
+# A completed transfer ends on a full green bar at 100.00 percent.
 $done = Get-RenderedProgressLine -Arguments @{
     Activity = 'Downloading Eclipse Temurin JDK 17'; ReceivedBytes = 199229440; TotalBytes = 199229440
     BytesPerSecond = 4100000; ElapsedSeconds = 46.3; RemainingSeconds = 0; Completed = $true
 }
-Assert-True ($done -match '100\.0%') 'Completed frame reaches 100 percent'
+Assert-True ($done -match '100\.00%') 'Completed frame reaches 100.00 percent'
 Assert-True ($done -notmatch '-') 'Completed bar has no empty segment'
 
 # Close-InlineProgressLine emits exactly one newline and only once.
@@ -415,6 +430,7 @@ try {
 # --- 13. The raw PATH is preserved, and the expanding API is not used -------
 Write-Host "`n[13] PATH handling" -ForegroundColor Yellow
 Assert-Equal 'C:\Android\platform-tools' (Normalize-PathEntry 'C:\Android\platform-tools\') 'A trailing separator is removed'
+Assert-Equal 'C:\Program Files\Eclipse Adoptium\jdk-17' (Normalize-PathEntry '"C:\Program Files\Eclipse Adoptium\jdk-17\"') 'Surrounding quotes and trailing separator on JAVA_HOME are removed'
 Assert-Equal '' (Normalize-PathEntry '   ') 'A blank entry normalizes to empty'
 $rawPath = Get-RawPathVariable -Scope 'Machine'
 Assert-True ($null -ne $rawPath) 'The raw Machine PATH can be read'
@@ -558,6 +574,184 @@ if ($scrapeHits.Count -gt 0) {
 Assert-Equal 0 (Get-WebExceptionStatusCode -Exception $null) 'A missing exception carries no HTTP status'
 Assert-Equal 0 (Get-WebExceptionStatusCode -Exception ([System.Exception]::new('boom'))) 'A non-web exception carries no HTTP status'
 Assert-Equal 0 (Get-WebExceptionStatusCode -Exception ([System.Exception]::new('outer', [Net.WebException]::new('inner')))) 'A wrapped WebException without a response carries no HTTP status'
+
+# --- 20. Percentage accuracy, HTTP total resolution, and console runner -------
+Write-Host "`n[20] Percentage calculation accuracy & interactive exit codes" -ForegroundColor Yellow
+
+# Exact base-10 percentage arithmetic: no binary floating-point drift (29% / 57% / 58%) and no
+# premature 100.00% while the transfer is still running.
+$inv = [Globalization.CultureInfo]::InvariantCulture
+Assert-Equal '-1.00' ((Get-TransferPercent -ReceivedBytes 500 -TotalBytes 0).ToString('0.00', $inv)) 'Unknown total size reports -1'
+Assert-Equal '0.00' ((Get-TransferPercent -ReceivedBytes 0 -TotalBytes 200000000).ToString('0.00', $inv)) 'Zero received bytes reports 0.00%'
+Assert-Equal '29.00' ((Get-TransferPercent -ReceivedBytes 58000000 -TotalBytes 200000000).ToString('0.00', $inv)) 'Exact 29% avoids binary float 28.99% drift'
+Assert-Equal '57.00' ((Get-TransferPercent -ReceivedBytes 114000000 -TotalBytes 200000000).ToString('0.00', $inv)) 'Exact 57% avoids binary float 56.99% drift'
+Assert-Equal '58.00' ((Get-TransferPercent -ReceivedBytes 116000000 -TotalBytes 200000000).ToString('0.00', $inv)) 'Exact 58% avoids binary float 57.99% drift'
+Assert-Equal '40.90' ((Get-TransferPercent -ReceivedBytes 81500000 -TotalBytes 199229440).ToString('0.00', $inv)) 'In-flight percentage truncates to completed hundredths'
+Assert-Equal '99.99' ((Get-TransferPercent -ReceivedBytes 199229439 -TotalBytes 199229440).ToString('0.00', $inv)) 'One byte short stays at 99.99%, never 100.00%'
+Assert-Equal '99.99' ((Get-TransferPercent -ReceivedBytes 210000000 -TotalBytes 199229440).ToString('0.00', $inv)) 'Overshooting an estimate before EOF stays below 100%'
+Assert-Equal '100.00' ((Get-TransferPercent -ReceivedBytes 199229440 -TotalBytes 199229440 -Completed).ToString('0.00', $inv)) 'Completed transfer reports 100.00%'
+
+# HTTP total byte resolution across fresh 200, resumed 206, chunked proxies, and API sizes.
+Assert-Equal 199229440 (Get-ResponseTotalBytes -ContentLength 199229440) 'Fresh 200 uses Content-Length'
+Assert-Equal 199229440 (Get-ResponseTotalBytes -ContentLength -1 -ContentRange 'bytes 10485760-199229439/199229440' -ExistingBytes 10485760 -Resumed $true) 'Resumed 206 reads total from Content-Range when Content-Length is missing'
+Assert-Equal 60000000 (Get-ResponseTotalBytes -ContentLength 50000000 -ExistingBytes 10000000 -Resumed $true) 'Resumed 206 adds Content-Length to existing partial bytes'
+Assert-Equal 0 (Get-ResponseTotalBytes -ContentLength -1 -ExistingBytes 10485760 -Resumed $true) 'Resumed 206 with neither Content-Range nor Content-Length stays unknown instead of locking at existing size'
+Assert-Equal 1073741824 (Get-ResponseTotalBytes -ContentLength -1 -StoredContentLength '1073741824') 'Google Cloud Storage stored length header provides exact size on chunked responses'
+Assert-Equal 0 (Get-ResponseTotalBytes -ContentLength 50000000 -ContentEncoding 'gzip') 'Compressed wire Content-Length is not mistaken for decoded byte length'
+Assert-Equal 199451238 (Get-ResponseTotalBytes -ContentLength -1 -ExpectedBytes 199451238) 'Publisher API size supplies exact total when CDN omits Content-Length'
+
+# Windows command-line argument quoting preserves semicolons, equals signs, spaces, and quotes.
+Assert-Equal 'platform-tools' (Format-ProcessArgument 'platform-tools') 'Plain package id needs no quotes'
+Assert-Equal '"platforms;android-36"' (Format-ProcessArgument 'platforms;android-36') 'Semicolon package id is quoted for cmd.exe'
+Assert-Equal '"--sdk_root=C:\Android"' (Format-ProcessArgument '--sdk_root=C:\Android') 'Equals argument is quoted for batch files'
+Assert-Equal '"C:\My SDK\bin\\"' (Format-ProcessArgument 'C:\My SDK\bin\') 'Trailing backslash before closing quote is escaped'
+Assert-Equal '""' (Format-ProcessArgument '') 'Empty argument is quoted'
+
+# Regression guard for the Android CLI output smearing bug:
+# Assigning "$code = Invoke-ExternalInteractive ..." must return a scalar [int] exit code and
+# never capture child stdout lines into $code (which made "$code -eq 0" evaluate to $false on an
+# @(<stdout>, 0) array and printed the progress bar inside "The Android CLI returned ...").
+$work20 = Join-Path ([IO.Path]::GetTempPath()) ('InteractiveTests-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work20 -Force | Out-Null
+try {
+    if ($env:OS -eq 'Windows_NT') {
+        $noisyBat = Join-Path $work20 'noisy-cli.bat'
+        Set-Content -LiteralPath $noisyBat -Value "@echo off`r`necho Installing build-tools/36.1.0... [#####] 100%%`r`nexit /b 0" -Encoding Ascii
+        $exitZero = Invoke-ExternalInteractive -Path $noisyBat -ArgumentList @('--sdk=C:\Android', 'sdk', 'install', 'platforms;android-36')
+
+        $answerBat = Join-Path $work20 'prompt-cli.bat'
+        Set-Content -LiteralPath $answerBat -Value "@echo off`r`nset /p ANS=`r`nif /i `"%ANS%`"==`"y`" exit /b 0`r`nexit /b 9" -Encoding Ascii
+        $answeredZero = Invoke-ExternalInteractive -Path $answerBat -Answers (Get-SdkLicenseAnswers 'y' 5)
+        $declinedCode = Invoke-ExternalInteractive -Path $answerBat -Answers (Get-SdkLicenseAnswers 'n' 2)
+    } else {
+        $exitZero = Invoke-ExternalInteractive -Path '/bin/sh' -ArgumentList @('-c', 'printf "Installing build-tools/36.1.0... [#####] 100%%"; exit 0')
+        $answeredZero = Invoke-ExternalInteractive -Path '/bin/sh' -ArgumentList @('-c', 'read ANS; [ "$ANS" = "y" ] && exit 0; exit 9') -Answers (Get-SdkLicenseAnswers 'y' 5)
+        $declinedCode = Invoke-ExternalInteractive -Path '/bin/sh' -ArgumentList @('-c', 'read ANS; [ "$ANS" = "y" ] && exit 0; exit 9') -Answers (Get-SdkLicenseAnswers 'n' 2)
+    }
+    Assert-True ($exitZero -is [int]) 'Invoke-ExternalInteractive returns a scalar [int], never an output array'
+    Assert-Equal 0 $exitZero 'Noisy child exiting 0 returns integer 0'
+    Assert-True ($exitZero -eq 0) '$code -eq 0 evaluates to $true even when child wrote stdout'
+    Assert-True (-not ($exitZero -ne 0)) '$code -ne 0 evaluates to $false when child exited 0'
+    Assert-Equal 0 $answeredZero 'Piped answers reach child stdin and return scalar exit code 0'
+    Assert-Equal 9 $declinedCode 'Declined prompt returns exact non-zero exit code 9'
+} finally {
+    Remove-Item -LiteralPath $work20 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Every helper imported by Progress.Demo.ps1 must exist in Android_SDK.ps1.
+$demoPath = Join-Path $PSScriptRoot 'Progress.Demo.ps1'
+$demoText = Get-Content -LiteralPath $demoPath -Raw
+$demoWantedMatch = [regex]::Match($demoText, '(?s)\$wanted\s*=\s*@\((?<list>.*?)\)')
+Assert-True $demoWantedMatch.Success 'Progress.Demo.ps1 helper list is present'
+foreach ($m in [regex]::Matches($demoWantedMatch.Groups['list'].Value, "'([^']+)'")) {
+    $fnName = $m.Groups[1].Value
+    $foundFn = $ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($n.Name -eq $fnName) }, $true)
+    Assert-True (@($foundFn).Count -gt 0) "Progress.Demo.ps1 helper [$fnName] exists in Android_SDK.ps1"
+}
+
+# --- 21. JAVA_HOME and PATH persistence, REG_SZ healing, and shell sync ------
+Write-Host "`n[21] JAVA_HOME & PATH persistence, REG_SZ healing, and shell propagation" -ForegroundColor Yellow
+$work21 = Join-Path ([IO.Path]::GetTempPath()) ('JavaPathTests-' + [guid]::NewGuid().ToString('N'))
+$fakeJdkHome = Join-Path $work21 'jdk-17.0.14.7-hotspot'
+$fakeJdkBin = Join-Path $fakeJdkHome 'bin'
+$fakeOracleShim = Join-Path $work21 'javapath'
+New-Item -ItemType Directory -Path $fakeJdkBin -Force | Out-Null
+New-Item -ItemType Directory -Path $fakeOracleShim -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $fakeJdkBin 'java.exe') -Value 'stub java' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $fakeJdkBin 'javac.exe') -Value 'stub javac' -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $fakeOracleShim 'java.exe') -Value 'stale java shim' -Encoding Ascii
+
+$savedJavaHome = $env:JAVA_HOME
+$savedProcessPath = $env:Path
+$origGetRawPath = ${function:Get-RawPathVariable}
+$origSetRawPath = ${function:Set-RawPathVariable}
+$origCheckEnv = ${function:Get-CheckEnvironmentVariable}
+try {
+    # Stub registry PATH state so tests run cleanly on Windows 5.1, Windows 7+, and Linux without
+    # altering real Machine/User registry hives.
+    $script:StubPathStore = @{
+        Machine = [pscustomobject]@{ Value = 'C:\Windows\System32;%JAVA_HOME%\bin'; Expandable = $false; Writes = 0 }
+        User    = [pscustomobject]@{ Value = ''; Expandable = $true; Writes = 0 }
+    }
+    function Get-RawPathVariable {
+        param([ValidateSet('User', 'Machine')][string]$Scope = 'Machine')
+        $entry = $script:StubPathStore[$Scope]
+        return [pscustomobject]@{ Value = [string]$entry.Value; Expandable = [bool]$entry.Expandable }
+    }
+    function Set-RawPathVariable {
+        param(
+            [ValidateSet('User', 'Machine')][string]$Scope = 'Machine',
+            [AllowEmptyString()][string]$Value = '',
+            [bool]$Expandable = $true
+        )
+        $entry = $script:StubPathStore[$Scope]
+        $entry.Value = $Value
+        $entry.Expandable = $Expandable
+        $entry.Writes = [int]$entry.Writes + 1
+        return $true
+    }
+    function Get-CheckEnvironmentVariable {
+        param([Parameter(Mandatory = $true)][string]$Name)
+        return [pscustomobject]@{
+            Process = [Environment]::GetEnvironmentVariable($Name, 'Process')
+            Machine = [Environment]::GetEnvironmentVariable($Name, 'Process')
+            User    = ''
+        }
+    }
+
+    # Regression 1: Unexpanded %JAVA_HOME%\bin inside a corrupted REG_SZ Machine PATH is NOT usable
+    # by new terminals and must NOT trick Add-PathEntry into skipping the literal bin directory.
+    $env:JAVA_HOME = $fakeJdkHome
+    $env:Path = '/usr/bin'
+    Assert-Equal 0 @(Get-PathEntryScopes $fakeJdkBin).Count 'Unexpanded %JAVA_HOME%\bin in REG_SZ PATH is not treated as configured'
+    Assert-True ($null -eq (Find-EnvironmentPathExecutable @('java.exe'))) 'java.exe is reported missing when only unexpanded REG_SZ %JAVA_HOME%\bin exists'
+    Assert-True (-not (Test-JavaPathConfigured)) 'Test-JavaPathConfigured detects missing JAVA_HOME\bin on PATH'
+
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 1 $script:StubPathStore['Machine'].Writes 'Add-PathEntry writes literal JDK bin even when %JAVA_HOME%\bin existed'
+    Assert-True ([bool]$script:StubPathStore['Machine'].Expandable) 'Add-PathEntry repairs corrupted REG_SZ PATH to REG_EXPAND_SZ'
+    $machineSplit = @($script:StubPathStore['Machine'].Value -split ';')
+    Assert-Equal (Normalize-PathEntry $fakeJdkBin) (Normalize-PathEntry $machineSplit[0]) 'Prepend puts literal JAVA_HOME\bin first in Machine PATH'
+    $procSplit = @($env:Path -split ';')
+    Assert-Equal (Normalize-PathEntry $fakeJdkBin) (Normalize-PathEntry $procSplit[0]) 'Prepend puts literal JAVA_HOME\bin first in Process PATH'
+    Assert-True (@(Get-PathEntryScopes $fakeJdkBin) -contains 'Machine') 'Get-PathEntryScopes recognizes persisted JAVA_HOME\bin'
+    Assert-Equal (Join-Path $fakeJdkBin 'java.exe') (Find-EnvironmentPathExecutable @('java.exe')).Path 'java.exe resolves directly to JAVA_HOME\bin\java.exe'
+    Assert-True (Test-JavaPathConfigured) 'Test-JavaPathConfigured succeeds once JAVA_HOME and PATH are configured'
+
+    # Idempotence: already first and already REG_EXPAND_SZ -> zero redundant registry writes.
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 1 $script:StubPathStore['Machine'].Writes 'No redundant registry write when JAVA_HOME\bin is already first and REG_EXPAND_SZ'
+
+    # Self-healing when entry is already at index 0 inside a corrupted REG_SZ key.
+    $script:StubPathStore['Machine'].Expandable = $false
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal 2 $script:StubPathStore['Machine'].Writes 'Corrupted REG_SZ PATH is rewritten even when literal entry is already at index 0'
+    Assert-True ([bool]$script:StubPathStore['Machine'].Expandable) 'REG_SZ self-heal restores ExpandString registry type'
+
+    # Prepend ordering: JAVA_HOME\bin moves ahead of stale Oracle javapath shims without duplicating.
+    $script:StubPathStore['Machine'].Value = ($fakeOracleShim + ';C:\Windows\System32;' + $fakeJdkBin)
+    $env:Path = ($fakeOracleShim + ';' + $fakeJdkBin)
+    Add-PathEntry -Entry $fakeJdkBin -Scope 'Machine' -Prepend
+    Assert-Equal (Join-Path $fakeJdkBin 'java.exe') (Find-EnvironmentPathExecutable @('java.exe')).Path 'Prepend places JDK ahead of stale javapath shim'
+    $dupCount = @($script:StubPathStore['Machine'].Value -split ';' | Where-Object { (Normalize-PathEntry $_) -ieq (Normalize-PathEntry $fakeJdkBin) }).Count
+    Assert-Equal 1 $dupCount 'Prepend deduplicates existing JAVA_HOME\bin entry'
+} finally {
+    ${function:Get-RawPathVariable} = $origGetRawPath
+    ${function:Set-RawPathVariable} = $origSetRawPath
+    ${function:Get-CheckEnvironmentVariable} = $origCheckEnv
+    $env:JAVA_HOME = $savedJavaHome
+    $env:Path = $savedProcessPath
+    Remove-Item -LiteralPath $work21 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Static wiring guards for Ensure-Jdk, Broadcast-EnvironmentChange, and Run.bat propagation.
+Assert-True ($scriptText -match 'Set-JavaEnvironment -JavaHome \$jdk\.JavaHome') 'Ensure-Jdk configures JAVA_HOME and PATH through Set-JavaEnvironment'
+Assert-True ($scriptText -match 'SendMessageTimeoutW' -and $scriptText -match 'SendMessageTimeoutA') 'Broadcast-EnvironmentChange sends both Unicode and ANSI WM_SETTINGCHANGE'
+$runBatPath = Join-Path $repoRoot 'Run.bat'
+$runBatRaw = [IO.File]::ReadAllText($runBatPath)
+Assert-True ($runBatRaw -notmatch '(?m)^setlocal\s*$') 'Run.bat does not trap environment updates inside setlocal'
+Assert-True ($runBatRaw -match '-PrintShellEnv') 'Run.bat propagates JAVA_HOME and PATH back into cmd.exe'
+Assert-True (($runBatRaw -replace "`r`n", '') -notmatch "`n") 'Run.bat preserves CRLF line endings for cmd.exe'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
